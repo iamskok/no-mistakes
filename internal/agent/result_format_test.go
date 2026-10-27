@@ -215,6 +215,110 @@ func TestConsumeStructuredResult(t *testing.T) {
 		effects.assertKept(t)
 	})
 
+	t.Run("earlier draft when a later object fails the schema", func(t *testing.T) {
+		effects := newEffects(t)
+		text := `{"done":true}{"done":"no"}`
+		result, err := ConsumeStructuredResult(context.Background(), RunOpts{
+			JSONSchema: schema,
+			FormatRecovery: &FormatRecovery{
+				Bound: 1,
+				Format: func(context.Context, string, json.RawMessage) (json.RawMessage, error) {
+					effects.formats++
+					return json.RawMessage(`{"done":true}`), nil
+				},
+			},
+		}, effects.task(t, text, true, nil))
+		assertFormatKept(t, err)
+		if !strings.Contains(err.Error(), "earlier JSON object") {
+			t.Fatalf("error = %v, want the earlier draft refused", err)
+		}
+		if result == nil || result.ResumeRetryable == nil || *result.ResumeRetryable {
+			t.Fatalf("ResumeRetryable = %v, want false", result)
+		}
+		if len(result.Output) != 0 {
+			t.Fatalf("earlier draft was accepted: %s", result.Output)
+		}
+		if effects.calls != 1 || effects.formats != 1 {
+			t.Fatalf("calls=%d formats=%d, want 1/1", effects.calls, effects.formats)
+		}
+		effects.assertKept(t)
+	})
+
+	t.Run("fenced earlier draft when a later object fails the schema", func(t *testing.T) {
+		effects := newEffects(t)
+		text := "```json\n{\"done\":true}\n```\n{\"done\":false}"
+		result, err := ConsumeStructuredResult(context.Background(), RunOpts{
+			JSONSchema: schema,
+			FormatRecovery: &FormatRecovery{
+				Bound: 1,
+				Format: func(context.Context, string, json.RawMessage) (json.RawMessage, error) {
+					effects.formats++
+					return json.RawMessage(`{"done":true}`), nil
+				},
+			},
+		}, effects.task(t, text, true, nil))
+		assertFormatKept(t, err)
+		if !strings.Contains(err.Error(), "earlier JSON object") {
+			t.Fatalf("error = %v, want the fenced earlier draft refused", err)
+		}
+		if result != nil && len(result.Output) != 0 {
+			t.Fatalf("fenced earlier draft was accepted: %s", result.Output)
+		}
+		effects.assertKept(t)
+	})
+
+	t.Run("canceled task returning valid output is not success", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		effects := newEffects(t)
+		result, err := ConsumeStructuredResult(ctx, RunOpts{JSONSchema: schema}, func(context.Context) (string, error) {
+			effects.calls++
+			effects.edits++
+			effects.tests++
+			effects.writePatch(t)
+			cancel()
+			return `{"done":true}`, nil
+		})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v, want canceled", err)
+		}
+		if result != nil && len(result.Output) != 0 {
+			t.Fatalf("canceled task reported output %s", result.Output)
+		}
+		if effects.calls != 1 {
+			t.Fatalf("canceled task ran %d times", effects.calls)
+		}
+		effects.assertKept(t)
+	})
+
+	t.Run("canceled recovery returning valid output is not success", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		effects := newEffects(t)
+		result, err := ConsumeStructuredResult(ctx, RunOpts{
+			JSONSchema: schema,
+			FormatRecovery: &FormatRecovery{
+				Bound: 1,
+				Format: func(context.Context, string, json.RawMessage) (json.RawMessage, error) {
+					effects.formats++
+					cancel()
+					return json.RawMessage(`{"done":true}`), nil
+				},
+			},
+		}, effects.task(t, "{\"done\":true}\nalready complete", true, nil))
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v, want canceled", err)
+		}
+		if result != nil && len(result.Output) != 0 {
+			t.Fatalf("canceled recovery reported output %s", result.Output)
+		}
+		if result == nil || result.ResumeRetryable == nil || *result.ResumeRetryable {
+			t.Fatalf("ResumeRetryable = %v, want false", result)
+		}
+		if effects.calls != 1 || effects.formats != 1 {
+			t.Fatalf("calls=%d formats=%d, want 1/1", effects.calls, effects.formats)
+		}
+		effects.assertKept(t)
+	})
+
 	t.Run("timeout", func(t *testing.T) {
 		effects := newEffects(t)
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
@@ -403,4 +507,50 @@ func TestRunWithRetry_FormatFailureDoesNotReplayTheTask(t *testing.T) {
 	if calls != 1 || formats != 1 {
 		t.Fatalf("calls=%d formats=%d, want 1/1", calls, formats)
 	}
+}
+
+func TestSelectsEarlierResult_InvalidLaterObjectKeepsTheDraft(t *testing.T) {
+	schema := doneResultSchema()
+	for _, terminal := range []string{
+		`{"done":true}{"done":"no"}`,
+		"```json\n{\"done\":true}\n```\n{\"done\":\"no\"}\n",
+	} {
+		if !selectsEarlierResult(terminal, schema, json.RawMessage(`{"done":true}`)) {
+			t.Fatalf("earlier draft accepted from %q", terminal)
+		}
+	}
+}
+
+func TestFallback_CompletedFormatFailureIsNotResumeRetryable(t *testing.T) {
+	schema := doneResultSchema()
+	primary := &formatResultAgent{name: "primary", schema: schema}
+	spare := &formatResultAgent{name: "spare", schema: schema}
+	wrapped := NewFallback([]Agent{primary, spare})
+	result, err := wrapped.Run(context.Background(), RunOpts{
+		Session: &SessionRef{ID: "fixer-session", Agent: "primary"},
+	})
+	assertFormatKept(t, err)
+	if result == nil || result.ResumeRetryable == nil || *result.ResumeRetryable {
+		t.Fatalf("ResumeRetryable = %v, want false", result)
+	}
+	if primary.calls != 1 || spare.calls != 0 {
+		t.Fatalf("primary=%d spare=%d, want 1/0", primary.calls, spare.calls)
+	}
+}
+
+type formatResultAgent struct {
+	name   string
+	schema json.RawMessage
+	calls  int
+}
+
+func (a *formatResultAgent) Name() string                { return a.name }
+func (a *formatResultAgent) SupportsSessionResume() bool { return true }
+func (a *formatResultAgent) Close() error                { return nil }
+func (a *formatResultAgent) Run(ctx context.Context, opts RunOpts) (*Result, error) {
+	a.calls++
+	opts.JSONSchema = a.schema
+	return ConsumeStructuredResult(ctx, opts, func(context.Context) (string, error) {
+		return "{\"done\":true}\nalready complete", nil
+	})
 }

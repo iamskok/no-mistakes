@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // FormatRecoveryMaxAttempts is the hard cap on format-only recovery attempts
@@ -78,6 +79,9 @@ func ConsumeStructuredResult(ctx context.Context, opts RunOpts, task func(contex
 	if err != nil {
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	result, parseErr := finalizeTextResult("structured-result", text, opts.JSONSchema, TokenUsage{})
 	if parseErr == nil {
 		return result, nil
@@ -91,7 +95,7 @@ func ConsumeStructuredResult(ctx context.Context, opts RunOpts, task func(contex
 func recoverResultFormat(ctx context.Context, opts RunOpts, result *Result, terminal string, cause error) (*Result, error) {
 	recovery := opts.FormatRecovery
 	if recovery == nil || recovery.Format == nil || recovery.CanEditOrTest || recovery.Bound < 1 {
-		return result, formatKept(cause, formatRecoveryRefusal(recovery))
+		return keptFormatResult(result), formatKept(cause, formatRecoveryRefusal(recovery))
 	}
 	bound := recovery.Bound
 	if bound > FormatRecoveryMaxAttempts {
@@ -100,18 +104,21 @@ func recoverResultFormat(ctx context.Context, opts RunOpts, result *Result, term
 	var lastErr error
 	for attempt := 1; attempt <= bound; attempt++ {
 		if err := ctx.Err(); err != nil {
-			return result, err
+			return keptFormatResult(result), err
 		}
 		output, err := recovery.Format(ctx, terminal, opts.JSONSchema)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return result, err
+				return keptFormatResult(result), err
 			}
 			lastErr = err
 			if errors.Is(err, ErrFormatRecoveryFailed) {
-				return result, formatKept(cause, "format-only recovery failed: "+err.Error())
+				return keptFormatResult(result), formatKept(cause, "format-only recovery failed: "+err.Error())
 			}
 			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return keptFormatResult(result), err
 		}
 		if err := acceptFormattedResult(opts.JSONSchema, output); err != nil {
 			lastErr = err
@@ -123,7 +130,20 @@ func recoverResultFormat(ctx context.Context, opts RunOpts, result *Result, term
 		}
 		return withStructuredOutput(result, terminal, output), nil
 	}
-	return result, formatKept(cause, fmt.Sprintf("format-only recovery exhausted %d attempts: %v", bound, lastErr))
+	return keptFormatResult(result), formatKept(cause, fmt.Sprintf("format-only recovery exhausted %d attempts: %v", bound, lastErr))
+}
+
+// keptFormatResult marks a completed format failure as ineligible for session
+// resume. A nil flag is treated as retryable once a resumed session id is
+// present, which would run the same fixer turn again in a fresh session.
+func keptFormatResult(result *Result) *Result {
+	var kept Result
+	if result != nil {
+		kept = *result
+	}
+	retryable := false
+	kept.ResumeRetryable = &retryable
+	return &kept
 }
 
 func formatRecoveryRefusal(recovery *FormatRecovery) string {
@@ -154,11 +174,10 @@ func acceptFormattedResult(schema, output json.RawMessage) error {
 }
 
 func selectsEarlierResult(terminal string, schema, output json.RawMessage) bool {
-	validationSchema, err := textValidationSchema(schema)
-	if err != nil {
+	if _, err := textValidationSchema(schema); err != nil {
 		return true
 	}
-	objects, _ := bareJSONObjects(terminal, validationSchema)
+	objects := orderedJSONObjects(terminal)
 	if len(objects) < 2 {
 		return false
 	}
@@ -171,6 +190,70 @@ func selectsEarlierResult(terminal string, schema, output json.RawMessage) bool 
 		}
 	}
 	return false
+}
+
+// orderedJSONObjects returns every JSON object in text order. Schema-invalid
+// objects and fenced JSON objects stay in the list, so an earlier draft is
+// still visible when a later object fails the schema.
+func orderedJSONObjects(text string) []json.RawMessage {
+	var objects []json.RawMessage
+	for i := 0; i < len(text); {
+		if strings.HasPrefix(text[i:], "```") {
+			contentStart, info := fenceContentStart(text, i)
+			if strings.EqualFold(strings.TrimSpace(info), "json") && contentStart > i && contentStart <= len(text) {
+				body := text[contentStart:]
+				end, closeEnd := indexJSONFenceClose(body)
+				candidate := body
+				next := len(text)
+				if end >= 0 {
+					candidate = body[:end]
+					next = contentStart + closeEnd
+				}
+				if obj, ok := rawJSONObject(candidate); ok {
+					objects = append(objects, obj)
+					if next <= i {
+						i++
+					} else {
+						i = next
+					}
+					continue
+				}
+			}
+			i += 3
+			continue
+		}
+		if text[i] == '{' {
+			end, ok := scanBalancedObject(text, i)
+			if ok {
+				if obj, ok := rawJSONObject(text[i:end]); ok {
+					objects = append(objects, obj)
+				}
+				if end <= i {
+					i++
+				} else {
+					i = end
+				}
+				continue
+			}
+		}
+		i++
+	}
+	return objects
+}
+
+func rawJSONObject(candidate string) (json.RawMessage, bool) {
+	candidate = strings.TrimSpace(candidate)
+	if candidate == "" || candidate[0] != '{' {
+		return nil, false
+	}
+	var value any
+	if err := json.Unmarshal([]byte(candidate), &value); err != nil {
+		return nil, false
+	}
+	if _, ok := value.(map[string]any); !ok {
+		return nil, false
+	}
+	return json.RawMessage(candidate), true
 }
 
 func withStructuredOutput(base *Result, terminal string, output json.RawMessage) *Result {
