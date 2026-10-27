@@ -110,6 +110,10 @@ func runWithRetry(
 		if err == nil {
 			return result, nil
 		}
+		if isResultFormatError(err) {
+			text, _ := terminalResultText(err)
+			return recoverResultFormat(ctx, opts, result, text, err)
+		}
 		lastResult = result
 		label, retry := classify(err)
 		if !retry {
@@ -198,25 +202,14 @@ var transientNeedles = []struct {
 	{"etimedout", "i/o timeout"},
 	{"tls handshake", "tls handshake failure"},
 	{"unexpected eof", "unexpected eof"},
-	// A model ending its turn with prose instead of the required JSON object
-	// is a stochastic behavior, not a deterministic defect: the step's real
-	// work is typically already complete, so a cold retry succeeds often
-	// enough to be worth more than a terminal failure.
-	{"ended its turn with prose", "prose final turn"},
+	// A finished turn whose terminal text fails the result schema is not listed
+	// here. Re-running the task replays edits and tests that already finished.
+	// result_format.go owns that failure: bounded format-only recovery, or a
+	// clear error that keeps the completed work.
 	// agy's strict tool-call validation kills the whole run when the model
 	// emits one malformed call; the step work is usually already complete.
 	{"declaring permissions", "agy permission declaration"},
 	{"invalid tool call", "invalid tool call"},
-	// Provider tool-protocol residue after a complete JSON object, or a
-	// structured answer split across two adjacent objects the parser could not
-	// fuse: in each case the step's real work is done and only the final text
-	// shape is wrong. Same rationale as the prose needle above. Generic schema
-	// validation failures stay non-transient (see the schema_validation
-	// negative case), and so do two objects that each validate on their own,
-	// which are competing verdicts rather than one split answer; only these two
-	// parse-specific strings are added.
-	{"invalid character '<' after top-level value", "provider protocol residue after JSON"},
-	{"split bare json objects could not be fused into one valid object", "unfused split bare JSON objects"},
 }
 
 var terminalNeedles = []struct {
