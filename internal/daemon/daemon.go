@@ -474,10 +474,11 @@ func recoverOnStartup(d *db.DB, p *paths.Paths, mgr *RunManager, layout *worktre
 	logStartupPhase("orphan_processes", orphanProcStarted)
 
 	// reapWorktrees applies the operator's retention policy to the default
-	// <NM_HOME>/worktrees tree before cleanupOrphanWorktrees runs its
-	// unconditional sweep of operator-placed (worktree_roots) leftovers, so a
-	// disabled or wide retention window is honored on the default tree
-	// instead of being bypassed by startup cleanup.
+	// <NM_HOME>/worktrees tree before cleanupOrphanWorktrees sweeps
+	// operator-placed (worktree_roots) leftovers, so a disabled or wide
+	// retention window is honored on the default tree instead of being
+	// bypassed by startup cleanup. Both still leave a checkout whose
+	// dirty-work snapshot cannot be made.
 	worktreeStarted := time.Now()
 	reapWorktrees(d, p, wtPolicy, now)
 	cleanupOrphanWorktrees(d, p, leftover)
@@ -805,7 +806,9 @@ func reportUnusableWorktreeRoots(d *db.DB, layout *worktrees.Layout) {
 // that are no longer active, for the operator-placed leftovers named by
 // recordedOrphanWorktrees (see worktree_roots in the global config) - that
 // directory is the operator's own, so every eligible leftover there is
-// removed unconditionally, once, at startup. It is DB-aware: a worktree is
+// removed once, at startup, after the same dirty-work snapshot as
+// finished-run cleanup. A checkout whose snapshot cannot be made stays.
+// It is DB-aware: a worktree is
 // only removed when its run row is terminal, or when there is no matching
 // run row at all. This is what keeps cleanup from deleting the checkout out
 // from under a pipeline that is still actually running (see
