@@ -104,15 +104,11 @@ func CaptureDirtyWork(ctx context.Context, req DirtyWorkRequest) (*DirtyWorkSnap
 	if _, err := Run(ctx, req.GateDir, "check-ref-format", ref); err != nil {
 		return nil, fmt.Errorf("snapshot ref %s: %w", ref, err)
 	}
-	paths, err := loadDirtyEntries(ctx, wt, entries, true)
-	if err != nil {
-		return nil, err
-	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
-	snap, err := writeDirtySnapshot(ctx, req, ref, paths)
+	snap, err := writeDirtySnapshot(ctx, req, ref, entries)
 	if err != nil {
 		return nil, err
 	}
@@ -216,15 +212,15 @@ func porcelainEntries(ctx context.Context, wt string) ([]dirtyEntry, error) {
 	return parsePorcelainZ(status)
 }
 
-func readDirtyEntries(ctx context.Context, wt string, screen bool) ([]dirtyEntry, error) {
+func readDirtyEntries(ctx context.Context, wt string) ([]dirtyEntry, error) {
 	entries, err := porcelainEntries(ctx, wt)
 	if err != nil || len(entries) == 0 {
 		return nil, err
 	}
-	return loadDirtyEntries(ctx, wt, entries, screen)
+	return loadDirtyEntries(ctx, wt, entries)
 }
 
-func loadDirtyEntries(ctx context.Context, wt string, entries []dirtyEntry, screen bool) ([]dirtyEntry, error) {
+func loadDirtyEntries(ctx context.Context, wt string, entries []dirtyEntry) ([]dirtyEntry, error) {
 	root := canonicalPath(wt)
 	for i := range entries {
 		rel, err := cleanCheckoutRel(entries[i].rel)
@@ -242,15 +238,6 @@ func loadDirtyEntries(ctx context.Context, wt string, entries []dirtyEntry, scre
 			return nil, fmt.Errorf("stat %s: %w", rel, lerr)
 		case lerr == nil && !snapshotableFile(info):
 			return nil, notSnapshotable(rel, info)
-		}
-		if screen {
-			secret, err := secretBearing(ctx, wt, entries[i], full)
-			if err != nil {
-				return nil, err
-			}
-			if secret {
-				return nil, fmt.Errorf("%w: %s is secret-bearing", ErrDirtyWorkRejected, rel)
-			}
 		}
 		entries[i].kind = dirtyKind(entries[i].code)
 	}
@@ -363,44 +350,28 @@ func cleanCheckoutRel(rel string) (string, error) {
 	return cleaned, nil
 }
 
-func secretBearing(ctx context.Context, wt string, entry dirtyEntry, full string) (bool, error) {
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
-	if secretPath(entry.rel) && entryHasBytes(ctx, wt, entry, full) {
-		return true, nil
-	}
-	if indexDiffers(entry.code) {
-		secret, err := indexBlobContainsSecret(ctx, wt, entry.rel)
-		if err != nil {
-			return false, err
-		}
-		if secret {
-			return true, nil
-		}
-	}
-	info, err := os.Lstat(full)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return false, nil
-		}
-		return false, err
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		target, err := os.Readlink(full)
-		if err != nil {
-			return false, err
-		}
-		return bytesContainSecret([]byte(target)), nil
-	}
-	if !info.Mode().IsRegular() {
-		return false, notSnapshotable(entry.rel, info)
-	}
-	return regularFileContainsSecret(ctx, full)
+var errNotRegular = errors.New("not a regular file")
+
+type preparedEntry struct {
+	dirtyEntry
+	mode string
+	tmp  string
+	link string
 }
 
-func indexDiffers(code string) bool {
-	return code != "??" && code[0] != ' ' && code[0] != 'D' && code[0] != '?'
+type fileStamp struct {
+	exists bool
+	mode   os.FileMode
+	size   int64
+	mod    int64
+}
+
+func worktreeDeleted(code string) bool {
+	return len(code) == 2 && code[1] == 'D'
+}
+
+func worktreeChanged(code string) bool {
+	return len(code) == 2 && code[1] != ' ' && code[1] != '?' && code[1] != 'D'
 }
 
 func entryHasBytes(ctx context.Context, wt string, entry dirtyEntry, full string) bool {
@@ -469,19 +440,11 @@ func bytesContainSecret(buf []byte) bool {
 	return false
 }
 
-func regularFileContainsSecret(ctx context.Context, full string) (bool, error) {
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
-	f, err := os.Open(full)
-	if err != nil {
-		return false, err
-	}
-	defer f.Close()
-	return readerContainsSecret(ctx, f)
+func readerContainsSecret(ctx context.Context, r io.Reader) (bool, error) {
+	return writeReaderScan(ctx, io.Discard, r)
 }
 
-func readerContainsSecret(ctx context.Context, r io.Reader) (bool, error) {
+func writeReaderScan(ctx context.Context, dst io.Writer, r io.Reader) (bool, error) {
 	overlap := secretMarkerOverlap()
 	buf := make([]byte, secretReadChunk)
 	var tail []byte
@@ -491,6 +454,9 @@ func readerContainsSecret(ctx context.Context, r io.Reader) (bool, error) {
 		}
 		n, err := r.Read(buf)
 		if n > 0 {
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return false, werr
+			}
 			window := make([]byte, 0, len(tail)+n)
 			window = append(window, tail...)
 			window = append(window, buf[:n]...)
@@ -512,15 +478,158 @@ func readerContainsSecret(ctx context.Context, r io.Reader) (bool, error) {
 	}
 }
 
-func indexBlobContainsSecret(ctx context.Context, dir, rel string) (bool, error) {
-	if _, err := Run(ctx, dir, "cat-file", "-e", ":"+rel); err != nil {
-		return false, fmt.Errorf("index blob %s: %w", rel, err)
-	}
-	found, err := gitStreamContainsSecret(ctx, dir, "cat-file", "blob", ":"+rel)
+func prepareDirtyContent(ctx context.Context, wt, tmp string, entries []dirtyEntry) ([]preparedEntry, error) {
+	cleaned, err := loadDirtyEntries(ctx, wt, entries)
 	if err != nil {
-		return false, fmt.Errorf("read index %s: %w", rel, err)
+		return nil, err
 	}
-	return found, nil
+	prepared := make([]preparedEntry, 0, len(cleaned))
+	for _, entry := range cleaned {
+		full := filepath.Join(wt, entry.rel)
+		if secretPath(entry.rel) && entryHasBytes(ctx, wt, entry, full) {
+			return nil, fmt.Errorf("%w: %s is secret-bearing", ErrDirtyWorkRejected, entry.rel)
+		}
+		item := preparedEntry{dirtyEntry: entry}
+		if _, err := os.Lstat(full); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				if entry.code == "??" || worktreeChanged(entry.code) {
+					return nil, fmt.Errorf("%w: %s disappeared while capturing dirty work", ErrDirtyWorkRejected, entry.rel)
+				}
+				prepared = append(prepared, item)
+				continue
+			}
+			return nil, err
+		}
+		mode, tmpPath, link, err := stageSnapshot(ctx, tmp, entry.rel, full)
+		if err != nil {
+			return nil, err
+		}
+		item.mode = mode
+		item.tmp = tmpPath
+		item.link = link
+		prepared = append(prepared, item)
+	}
+	return prepared, nil
+}
+
+func stageSnapshot(ctx context.Context, tmpDir, rel, full string) (mode, tmpPath, link string, err error) {
+	if err := ctx.Err(); err != nil {
+		return "", "", "", err
+	}
+	info, err := os.Lstat(full)
+	if err != nil {
+		return "", "", "", err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Readlink(full)
+		if err != nil {
+			return "", "", "", err
+		}
+		if bytesContainSecret([]byte(target)) {
+			return "", "", "", fmt.Errorf("%w: %s is secret-bearing", ErrDirtyWorkRejected, rel)
+		}
+		return "120000", "", target, nil
+	}
+	if !info.Mode().IsRegular() {
+		return "", "", "", notSnapshotable(rel, info)
+	}
+	f, err := openRegular(full)
+	if err != nil {
+		if errors.Is(err, errNotRegular) {
+			return "", "", "", notSnapshotable(rel, info)
+		}
+		return "", "", "", err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return "", "", "", err
+	}
+	if !st.Mode().IsRegular() {
+		return "", "", "", notSnapshotable(rel, st)
+	}
+	dst, err := os.CreateTemp(tmpDir, "blob-")
+	if err != nil {
+		return "", "", "", err
+	}
+	secret, copyErr := writeReaderScan(ctx, dst, f)
+	closeErr := dst.Close()
+	if copyErr != nil {
+		return "", "", "", copyErr
+	}
+	if closeErr != nil {
+		return "", "", "", closeErr
+	}
+	if secret {
+		return "", "", "", fmt.Errorf("%w: %s is secret-bearing", ErrDirtyWorkRejected, rel)
+	}
+	mode = "100644"
+	if st.Mode()&0o111 != 0 {
+		mode = "100755"
+	}
+	return mode, dst.Name(), "", nil
+}
+
+func scanStagedBlobs(ctx context.Context, wt, indexFile string) error {
+	out, err := runInDirWithEnvAndInputRaw(ctx, wt, []string{"GIT_INDEX_FILE=" + indexFile}, "", "diff-index", "--cached", "-z", "HEAD")
+	if err != nil {
+		return fmt.Errorf("read staged changes: %w", err)
+	}
+	return walkStagedBlobs(out, func(path, sha string) error {
+		found, err := gitStreamContainsSecret(ctx, wt, "cat-file", "blob", sha)
+		if err != nil {
+			return fmt.Errorf("read index %s: %w", path, err)
+		}
+		if found {
+			return fmt.Errorf("%w: %s is secret-bearing", ErrDirtyWorkRejected, path)
+		}
+		return nil
+	})
+}
+
+func walkStagedBlobs(out []byte, fn func(path, sha string) error) error {
+	for len(out) > 0 {
+		metaEnd := bytes.IndexByte(out, 0)
+		if metaEnd < 0 {
+			return fmt.Errorf("%w: unreadable staged diff", ErrDirtyWorkRejected)
+		}
+		meta := out[:metaEnd]
+		out = out[metaEnd+1:]
+		pathEnd := bytes.IndexByte(out, 0)
+		if pathEnd < 0 {
+			return fmt.Errorf("%w: unreadable staged diff", ErrDirtyWorkRejected)
+		}
+		path := string(out[:pathEnd])
+		out = out[pathEnd+1:]
+		fields := bytes.Fields(meta)
+		if len(fields) < 5 {
+			return fmt.Errorf("%w: unreadable staged diff", ErrDirtyWorkRejected)
+		}
+		status := string(fields[4])
+		sha := string(fields[3])
+		if status == "D" || zeroSHA(sha) {
+			continue
+		}
+		if status[0] == 'R' || status[0] == 'C' {
+			return fmt.Errorf("%w: rename or copy in the index; refusing a partial snapshot", ErrDirtyWorkRejected)
+		}
+		if err := fn(path, sha); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func zeroSHA(sha string) bool {
+	if sha == "" {
+		return true
+	}
+	for _, c := range sha {
+		if c != '0' {
+			return false
+		}
+	}
+	return true
 }
 
 func gitStreamContainsSecret(ctx context.Context, dir string, args ...string) (bool, error) {
@@ -566,7 +675,7 @@ func gitStreamContainsSecret(ctx context.Context, dir string, args ...string) (b
 	return false, nil
 }
 
-func writeDirtySnapshot(ctx context.Context, req DirtyWorkRequest, ref string, paths []dirtyEntry) (*DirtyWorkSnapshot, error) {
+func writeDirtySnapshot(ctx context.Context, req DirtyWorkRequest, ref string, entries []dirtyEntry) (*DirtyWorkSnapshot, error) {
 	wt := req.Worktree
 	head, err := Run(ctx, wt, "rev-parse", "--verify", "HEAD")
 	if err != nil {
@@ -578,6 +687,10 @@ func writeDirtySnapshot(ctx context.Context, req DirtyWorkRequest, ref string, p
 	}
 	defer os.RemoveAll(tmp)
 
+	prepared, err := prepareDirtyContent(ctx, wt, tmp, entries)
+	if err != nil {
+		return nil, err
+	}
 	indexPath, err := absoluteGitPath(ctx, wt, "index")
 	if err != nil {
 		return nil, err
@@ -598,8 +711,11 @@ func writeDirtySnapshot(ctx context.Context, req DirtyWorkRequest, ref string, p
 	if liveTree != indexTree {
 		return nil, fmt.Errorf("index changed while capturing dirty work")
 	}
+	if err := scanStagedBlobs(ctx, wt, indexCopy); err != nil {
+		return nil, err
+	}
 
-	workTree, err := buildWorkTree(ctx, wt, filepath.Join(tmp, "worktree-index"))
+	workTree, err := buildWorkTree(ctx, wt, tmp, indexCopy, prepared)
 	if err != nil {
 		return nil, err
 	}
@@ -611,17 +727,11 @@ func writeDirtySnapshot(ctx context.Context, req DirtyWorkRequest, ref string, p
 		return nil, fmt.Errorf("capture changed the checkout index")
 	}
 
-	var untracked []dirtyEntry
-	for _, path := range paths {
-		if path.code == "??" {
-			untracked = append(untracked, path)
-		}
-	}
 	untrackedTree := ""
 	untrackedCommit := ""
 	ident := dirtyWorkIdentity()
-	if len(untracked) > 0 {
-		untrackedTree, err = writeUntrackedTree(ctx, wt, tmp, untracked)
+	if hasUntracked(prepared) {
+		untrackedTree, err = writeUntrackedTree(ctx, wt, tmp, prepared)
 		if err != nil {
 			return nil, err
 		}
@@ -634,7 +744,7 @@ func writeDirtySnapshot(ctx context.Context, req DirtyWorkRequest, ref string, p
 	if err != nil {
 		return nil, fmt.Errorf("commit index tree: %w", err)
 	}
-	message := dirtyWorkMessage(head, req.BaseSHA, indexTree, workTree, untrackedTree, paths)
+	message := dirtyWorkMessage(head, req.BaseSHA, indexTree, workTree, untrackedTree, dirtyEntries(prepared))
 	msgPath := filepath.Join(tmp, "message")
 	if err := os.WriteFile(msgPath, []byte(message), 0o644); err != nil {
 		return nil, err
@@ -684,7 +794,24 @@ func writeDirtySnapshot(ctx context.Context, req DirtyWorkRequest, ref string, p
 	return &DirtyWorkSnapshot{Ref: ref, Commit: commit, Head: head, Base: base}, nil
 }
 
-func writeUntrackedTree(ctx context.Context, wt, tmp string, paths []dirtyEntry) (string, error) {
+func dirtyEntries(prepared []preparedEntry) []dirtyEntry {
+	entries := make([]dirtyEntry, len(prepared))
+	for i := range prepared {
+		entries[i] = prepared[i].dirtyEntry
+	}
+	return entries
+}
+
+func hasUntracked(prepared []preparedEntry) bool {
+	for _, path := range prepared {
+		if path.code == "??" {
+			return true
+		}
+	}
+	return false
+}
+
+func writeUntrackedTree(ctx context.Context, wt, tmp string, prepared []preparedEntry) (string, error) {
 	index := filepath.Join(tmp, "untracked-index")
 	if err := os.WriteFile(index, nil, 0o644); err != nil {
 		return "", err
@@ -693,117 +820,57 @@ func writeUntrackedTree(ctx context.Context, wt, tmp string, paths []dirtyEntry)
 	if _, err := RunWithEnv(ctx, wt, env, "read-tree", "--empty"); err != nil {
 		return "", fmt.Errorf("prepare untracked index: %w", err)
 	}
-	var info strings.Builder
-	for _, path := range paths {
-		full := filepath.Join(wt, path.rel)
-		mode, blob, err := hashUntracked(ctx, wt, full)
-		if err != nil {
-			return "", fmt.Errorf("hash %s: %w", path.rel, err)
-		}
-		fmt.Fprintf(&info, "%s %s\t%s\n", mode, blob, filepath.ToSlash(path.rel))
+	info, err := indexInfo(ctx, wt, prepared, func(path preparedEntry) bool { return path.code == "??" })
+	if err != nil {
+		return "", err
 	}
-	if _, err := runInDirWithEnvAndInput(ctx, wt, env, info.String(), "update-index", "--index-info"); err != nil {
-		return "", fmt.Errorf("record untracked files: %w", err)
+	if info != "" {
+		if _, err := runInDirWithEnvAndInput(ctx, wt, env, info, "update-index", "--index-info"); err != nil {
+			return "", fmt.Errorf("record untracked files: %w", err)
+		}
 	}
 	tree, err := RunWithEnv(ctx, wt, env, "write-tree")
 	if err != nil {
 		return "", fmt.Errorf("write untracked tree: %w", err)
 	}
-	for _, path := range paths {
-		got, err := RunWithEnv(ctx, wt, env, "rev-parse", "--verify", tree+":"+filepath.ToSlash(path.rel))
-		if err != nil {
-			return "", fmt.Errorf("untracked snapshot missing %s: %w", path.rel, err)
-		}
-		full := filepath.Join(wt, path.rel)
-		want, err := hashFileBlob(ctx, wt, full)
-		if err != nil {
-			return "", err
-		}
-		if got != want {
-			return "", fmt.Errorf("untracked snapshot of %s does not match the checkout", path.rel)
-		}
-	}
 	return tree, nil
 }
 
-func hashUntracked(ctx context.Context, wt, full string) (mode, blob string, err error) {
-	info, err := os.Lstat(full)
-	if err != nil {
-		return "", "", err
-	}
-	if !snapshotableFile(info) {
-		return "", "", notSnapshotable(filepath.Base(full), info)
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		target, err := os.Readlink(full)
+func buildWorkTree(ctx context.Context, wt, tmp, indexCopy string, prepared []preparedEntry) (string, error) {
+	if !needsWorktreeApply(prepared) {
+		tree, err := RunWithEnv(ctx, wt, []string{"GIT_INDEX_FILE=" + indexCopy}, "write-tree")
 		if err != nil {
-			return "", "", err
+			return "", fmt.Errorf("write worktree tree: %w", err)
 		}
-		if bytesContainSecret([]byte(target)) {
-			return "", "", fmt.Errorf("%w: %s is secret-bearing", ErrDirtyWorkRejected, filepath.Base(full))
-		}
-		blob, err = runInDirWithEnvAndInput(ctx, wt, nil, target, "hash-object", "-w", "--stdin")
-		if err != nil {
-			return "", "", err
-		}
-		return "120000", blob, nil
+		return tree, nil
 	}
-	secret, err := regularFileContainsSecret(ctx, full)
-	if err != nil {
-		return "", "", err
+	workIndex := filepath.Join(tmp, "worktree-index")
+	if err := copyFile(workIndex, indexCopy); err != nil {
+		return "", err
 	}
-	if secret {
-		return "", "", fmt.Errorf("%w: %s is secret-bearing", ErrDirtyWorkRejected, filepath.Base(full))
-	}
-	mode = "100644"
-	if info.Mode()&0o111 != 0 {
-		mode = "100755"
-	}
-	blob, err = Run(ctx, wt, "hash-object", "-w", "--", full)
-	if err != nil {
-		return "", "", err
-	}
-	return mode, blob, nil
-}
-
-func hashFileBlob(ctx context.Context, wt, full string) (string, error) {
-	info, err := os.Lstat(full)
+	env := []string{"GIT_INDEX_FILE=" + workIndex}
+	info, err := indexInfo(ctx, wt, prepared, func(path preparedEntry) bool {
+		return path.code != "??" && worktreeChanged(path.code)
+	})
 	if err != nil {
 		return "", err
 	}
-	if !snapshotableFile(info) {
-		return "", notSnapshotable(filepath.Base(full), info)
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		target, err := os.Readlink(full)
-		if err != nil {
-			return "", err
+	if info != "" {
+		if _, err := runInDirWithEnvAndInput(ctx, wt, env, info, "update-index", "--index-info"); err != nil {
+			return "", fmt.Errorf("snapshot tracked worktree: %w", err)
 		}
-		return runInDirWithEnvAndInput(ctx, wt, nil, target, "hash-object", "--stdin")
 	}
-	return Run(ctx, wt, "hash-object", "--", full)
-}
-
-func buildWorkTree(ctx context.Context, wt, indexFile string) (string, error) {
-	if _, err := readDirtyEntries(ctx, wt, true); err != nil {
-		return "", err
-	}
-	indexPath, err := absoluteGitPath(ctx, wt, "index")
-	if err != nil {
-		return "", err
-	}
-	if err := copyFile(indexFile, indexPath); err != nil {
-		return "", err
-	}
-	env := []string{"GIT_INDEX_FILE=" + indexFile}
-	if _, err := RunWithEnv(ctx, wt, env, "add", "-u"); err != nil {
-		return "", fmt.Errorf("snapshot tracked worktree: %w", err)
-	}
-	if _, err := RunWithEnv(ctx, wt, env, "diff-files", "--quiet"); err != nil {
-		if ctx.Err() != nil {
-			return "", ctx.Err()
+	var removes []string
+	for _, path := range prepared {
+		if path.code != "??" && worktreeDeleted(path.code) {
+			removes = append(removes, filepath.ToSlash(path.rel))
 		}
-		return "", fmt.Errorf("tracked worktree snapshot does not match the checkout: %w", err)
+	}
+	if len(removes) > 0 {
+		args := append([]string{"update-index", "--force-remove", "--"}, removes...)
+		if _, err := RunWithEnv(ctx, wt, env, args...); err != nil {
+			return "", fmt.Errorf("snapshot tracked deletion: %w", err)
+		}
 	}
 	tree, err := RunWithEnv(ctx, wt, env, "write-tree")
 	if err != nil {
@@ -812,9 +879,76 @@ func buildWorkTree(ctx context.Context, wt, indexFile string) (string, error) {
 	return tree, nil
 }
 
+func needsWorktreeApply(prepared []preparedEntry) bool {
+	for _, path := range prepared {
+		if path.code == "??" {
+			continue
+		}
+		if worktreeDeleted(path.code) || worktreeChanged(path.code) {
+			return true
+		}
+	}
+	return false
+}
+
+func indexInfo(ctx context.Context, wt string, prepared []preparedEntry, include func(preparedEntry) bool) (string, error) {
+	var info strings.Builder
+	for _, path := range prepared {
+		if !include(path) {
+			continue
+		}
+		blob, err := hashPrepared(ctx, wt, path, true)
+		if err != nil {
+			return "", fmt.Errorf("hash %s: %w", path.rel, err)
+		}
+		fmt.Fprintf(&info, "%s %s\t%s\n", path.mode, blob, filepath.ToSlash(path.rel))
+	}
+	return info.String(), nil
+}
+
+func hashPrepared(ctx context.Context, wt string, path preparedEntry, write bool) (string, error) {
+	args := []string{"hash-object"}
+	if write {
+		args = append(args, "-w")
+	}
+	if path.mode == "120000" {
+		args = append(args, "--no-filters", "--stdin")
+		return runInDirWithEnvAndInput(ctx, wt, nil, path.link, args...)
+	}
+	if path.tmp == "" {
+		return "", fmt.Errorf("%w: %s has no staged bytes", ErrDirtyWorkRejected, path.rel)
+	}
+	args = append(args, "--path="+filepath.ToSlash(path.rel), "--", path.tmp)
+	return Run(ctx, wt, args...)
+}
+
 func recheckDirtyWork(ctx context.Context, wt, tmp, head, indexTree, workTree, untrackedTree string) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	entries, err := readDirtyEntries(ctx, wt)
+	if err != nil {
+		return err
+	}
+	before, err := stampDirtyFiles(wt, entries)
+	if err != nil {
+		return err
+	}
+	if err := matchUntracked(ctx, wt, tmp, entries, untrackedTree); err != nil {
+		return err
+	}
+	if err := matchWorkTree(ctx, wt, tmp, workTree); err != nil {
+		return err
+	}
+	if err := untrackedSetMatches(ctx, wt, entries); err != nil {
+		return err
+	}
+	after, err := stampDirtyFiles(wt, entries)
+	if err != nil {
+		return err
+	}
+	if !sameStamps(before, after) {
+		return fmt.Errorf("checkout changed while capturing dirty work")
 	}
 	current, err := Run(ctx, wt, "rev-parse", "--verify", "HEAD")
 	if err != nil {
@@ -830,51 +964,167 @@ func recheckDirtyWork(ctx context.Context, wt, tmp, head, indexTree, workTree, u
 	if live != indexTree {
 		return fmt.Errorf("index changed while capturing dirty work")
 	}
-	gotWork, err := buildWorkTree(ctx, wt, filepath.Join(tmp, "recheck-worktree-index"))
-	if err != nil {
-		return err
-	}
-	if gotWork != workTree {
-		return fmt.Errorf("tracked worktree changed while capturing dirty work")
-	}
-	liveAgain, err := Run(ctx, wt, "write-tree")
-	if err != nil {
-		return err
-	}
-	if liveAgain != indexTree {
-		return fmt.Errorf("capture changed the checkout index")
-	}
-	entries, err := readDirtyEntries(ctx, wt, true)
-	if err != nil {
-		return err
-	}
-	var untracked []dirtyEntry
+	return nil
+}
+
+func matchUntracked(ctx context.Context, wt, tmp string, entries []dirtyEntry, untrackedTree string) error {
+	var paths []dirtyEntry
 	for _, entry := range entries {
 		if entry.code == "??" {
-			untracked = append(untracked, entry)
+			paths = append(paths, entry)
 		}
 	}
 	if untrackedTree == "" {
-		if len(untracked) != 0 {
+		if len(paths) != 0 {
 			return fmt.Errorf("untracked files appeared while capturing dirty work")
 		}
 		return nil
 	}
-	if len(untracked) == 0 {
+	if len(paths) == 0 {
 		return fmt.Errorf("untracked files disappeared while capturing dirty work")
 	}
-	got, err := writeUntrackedTree(ctx, wt, tmp, untracked)
+	for _, path := range paths {
+		mode, blob, err := hashLive(ctx, wt, tmp, path.rel)
+		if err != nil {
+			return err
+		}
+		wantMode, wantBlob, err := treeEntry(ctx, wt, untrackedTree, path.rel)
+		if err != nil || mode != wantMode || blob != wantBlob {
+			return fmt.Errorf("untracked files changed while capturing dirty work")
+		}
+	}
+	return nil
+}
+
+func hashLive(ctx context.Context, wt, tmp, rel string) (mode, blob string, err error) {
+	mode, tmpPath, link, err := stageSnapshot(ctx, tmp, rel, filepath.Join(wt, rel))
+	if err != nil {
+		return "", "", err
+	}
+	blob, err = hashPrepared(ctx, wt, preparedEntry{
+		dirtyEntry: dirtyEntry{rel: rel},
+		mode:       mode,
+		tmp:        tmpPath,
+		link:       link,
+	}, false)
+	if err != nil {
+		return "", "", err
+	}
+	return mode, blob, nil
+}
+
+func treeEntry(ctx context.Context, wt, tree, rel string) (mode, blob string, err error) {
+	out, err := RunRaw(ctx, wt, "ls-tree", "-z", tree, "--", filepath.ToSlash(rel))
+	if err != nil {
+		return "", "", err
+	}
+	out = bytes.TrimRight(out, "\x00")
+	if len(out) == 0 {
+		return "", "", fmt.Errorf("missing %s", rel)
+	}
+	tab := bytes.IndexByte(out, '\t')
+	if tab < 0 {
+		return "", "", fmt.Errorf("unreadable tree entry %s", rel)
+	}
+	fields := bytes.Fields(out[:tab])
+	if len(fields) < 3 {
+		return "", "", fmt.Errorf("unreadable tree entry %s", rel)
+	}
+	return string(fields[0]), string(fields[2]), nil
+}
+
+func matchWorkTree(ctx context.Context, wt, tmp, workTree string) error {
+	index := filepath.Join(tmp, "compare-index")
+	if err := os.WriteFile(index, nil, 0o644); err != nil {
+		return err
+	}
+	env := []string{"GIT_INDEX_FILE=" + index}
+	if _, err := RunWithEnv(ctx, wt, env, "read-tree", workTree); err != nil {
+		return fmt.Errorf("read tracked snapshot: %w", err)
+	}
+	if _, err := RunWithEnv(ctx, wt, env, "update-index", "--refresh"); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("tracked worktree changed while capturing dirty work")
+	}
+	return nil
+}
+
+func untrackedSetMatches(ctx context.Context, wt string, entries []dirtyEntry) error {
+	out, err := RunRaw(ctx, wt, "ls-files", "--others", "--exclude-standard", "-z")
 	if err != nil {
 		return err
 	}
-	if got != untrackedTree {
+	want := map[string]struct{}{}
+	for _, entry := range entries {
+		if entry.code == "??" {
+			want[entry.rel] = struct{}{}
+		}
+	}
+	live := 0
+	for _, raw := range bytes.Split(out, []byte{0}) {
+		if len(raw) == 0 {
+			continue
+		}
+		rel, err := cleanCheckoutRel(string(raw))
+		if err != nil {
+			return err
+		}
+		if _, ok := want[rel]; !ok {
+			return fmt.Errorf("untracked files changed while capturing dirty work")
+		}
+		info, err := os.Lstat(filepath.Join(wt, rel))
+		if err != nil {
+			return fmt.Errorf("untracked files changed while capturing dirty work")
+		}
+		if !snapshotableFile(info) {
+			return notSnapshotable(rel, info)
+		}
+		live++
+	}
+	if live != len(want) {
 		return fmt.Errorf("untracked files changed while capturing dirty work")
 	}
 	return nil
 }
 
+func stampDirtyFiles(wt string, entries []dirtyEntry) (map[string]fileStamp, error) {
+	stamps := make(map[string]fileStamp, len(entries))
+	for _, entry := range entries {
+		info, err := os.Lstat(filepath.Join(wt, entry.rel))
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				stamps[entry.rel] = fileStamp{}
+				continue
+			}
+			return nil, err
+		}
+		stamps[entry.rel] = fileStamp{
+			exists: true,
+			mode:   info.Mode(),
+			size:   info.Size(),
+			mod:    info.ModTime().UnixNano(),
+		}
+	}
+	return stamps, nil
+}
+
+func sameStamps(before, after map[string]fileStamp) bool {
+	if len(before) != len(after) {
+		return false
+	}
+	for rel, stamp := range before {
+		other, ok := after[rel]
+		if !ok || stamp != other {
+			return false
+		}
+	}
+	return true
+}
+
 func assertCheckoutClean(ctx context.Context, wt string) error {
-	entries, err := readDirtyEntries(ctx, wt, false)
+	entries, err := readDirtyEntries(ctx, wt)
 	if err != nil {
 		return err
 	}
