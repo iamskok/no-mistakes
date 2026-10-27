@@ -36,6 +36,47 @@ func TestCaptureDirtyWork_RejectsFifoWithoutOpening(t *testing.T) {
 	}
 }
 
+func TestCaptureDirtyWork_RejectsUntrackedFifoWithoutOpening(t *testing.T) {
+	gate, wt, _, _ := newDirtyWorkGate(t, "ufifo")
+	fifo := filepath.Join(wt, "pipe")
+	if err := syscall.Mkfifo(fifo, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := captureWithin(t, fifo, func() error {
+		_, err := CaptureDirtyWork(context.Background(), DirtyWorkRequest{GateDir: gate, Worktree: wt, RunID: dirtyWorkRunID})
+		return err
+	})
+	if !errors.Is(err, ErrDirtyWorkRejected) {
+		t.Fatalf("untracked fifo capture error = %v", err)
+	}
+	if _, statErr := os.Stat(fifo); statErr != nil {
+		t.Fatal(statErr)
+	}
+	if _, err := Run(context.Background(), gate, "rev-parse", "--verify", "--quiet", DirtyWorkRef(dirtyWorkRunID)); err == nil {
+		t.Fatal("untracked fifo published a snapshot ref")
+	}
+}
+
+func TestCaptureDirtyWork_IgnoredFifoIsNotDirtyWork(t *testing.T) {
+	gate, wt, _, _ := newDirtyWorkGate(t, "ififo")
+	writeFile(t, filepath.Join(wt, ".gitignore"), "pipe\n")
+	run(t, wt, "git", "add", "--", ".gitignore")
+	run(t, wt, "git", "commit", "-m", "ignore pipe")
+	fifo := filepath.Join(wt, "pipe")
+	if err := syscall.Mkfifo(fifo, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var snap *DirtyWorkSnapshot
+	err := captureWithin(t, fifo, func() error {
+		var captureErr error
+		snap, captureErr = CaptureDirtyWork(context.Background(), DirtyWorkRequest{GateDir: gate, Worktree: wt, RunID: dirtyWorkRunID})
+		return captureErr
+	})
+	if err != nil || snap != nil {
+		t.Fatalf("ignored fifo capture = %#v, %v", snap, err)
+	}
+}
+
 func TestCaptureDirtyWork_SnapshotsSymlinkToFifo(t *testing.T) {
 	ctx := context.Background()
 	gate, wt, head, _ := newDirtyWorkGate(t, "fifo-link")

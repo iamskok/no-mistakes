@@ -362,6 +362,57 @@ func TestDirtyWorkStillMatchesRefusesDriftBeforeRemoval(t *testing.T) {
 	}
 }
 
+func TestDirtyWorkStillMatchesRequiresTheSnapshotTree(t *testing.T) {
+	ctx := context.Background()
+	gate, wt, _, _ := newDirtyWorkGate(t, "equal")
+	writeFile(t, filepath.Join(wt, "a.txt"), "a\n")
+	writeFile(t, filepath.Join(wt, "b.txt"), "b\n")
+	snap, err := CaptureDirtyWork(ctx, DirtyWorkRequest{GateDir: gate, Worktree: wt, RunID: dirtyWorkRunID})
+	if err != nil {
+		t.Fatalf("capture: %v", err)
+	}
+	if err := os.Remove(filepath.Join(wt, "b.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := DirtyWorkStillMatches(ctx, wt, snap); err == nil {
+		t.Fatal("deleted untracked file still matched the snapshot")
+	}
+	writeFile(t, filepath.Join(wt, "b.txt"), "b\n")
+	if err := DirtyWorkStillMatches(ctx, wt, snap); err != nil {
+		t.Fatalf("restored untracked file: %v", err)
+	}
+	writeFile(t, filepath.Join(wt, "gone.txt"), "changed while clean\n")
+	if err := DirtyWorkStillMatches(ctx, wt, snap); err == nil {
+		t.Fatal("edit to a clean tracked file still matched the snapshot")
+	}
+	writeFile(t, filepath.Join(wt, "gone.txt"), "gone\n")
+	if err := DirtyWorkStillMatches(ctx, wt, snap); err != nil {
+		t.Fatalf("restored clean file: %v", err)
+	}
+	run(t, wt, "git", "add", "--", "a.txt")
+	if err := DirtyWorkStillMatches(ctx, wt, snap); err == nil {
+		t.Fatal("index change still matched the snapshot")
+	}
+}
+
+func TestCaptureDirtyWork_IgnoredFileIsNotSnapshotted(t *testing.T) {
+	ctx := context.Background()
+	gate, wt, _, _ := newDirtyWorkGate(t, "ignored")
+	const marker = "nm-ignored-env-marker-8f3a"
+	writeFile(t, filepath.Join(wt, ".gitignore"), ".env\n")
+	run(t, wt, "git", "add", "--", ".gitignore")
+	run(t, wt, "git", "commit", "-m", "ignore env")
+	writeFile(t, filepath.Join(wt, ".env"), marker+"\n")
+	snap, err := CaptureDirtyWork(ctx, DirtyWorkRequest{GateDir: gate, Worktree: wt, RunID: dirtyWorkRunID})
+	if err != nil || snap != nil {
+		t.Fatalf("ignored file capture = %#v, %v", snap, err)
+	}
+	assertObjectStoreLacks(t, gate, marker)
+	if _, err := os.Stat(filepath.Join(wt, ".env")); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCaptureDirtyWork_RejectsUnrelatedHome(t *testing.T) {
 	ctx := context.Background()
 	gate, wt, _, _ := newDirtyWorkGate(t, "owned")

@@ -1561,6 +1561,7 @@ func newAxiRespondCmd() *cobra.Command {
 			"commits, findings and evidence stay available. Unique uncommitted work is\n" +
 			"snapshotted in the gate at refs/no-mistakes/dirty/<run-id> before the worktree\n" +
 			"is removed, and the worktree is kept if that snapshot cannot be verified.\n" +
+			"Ignored files are not part of that snapshot and are removed with the worktree.\n" +
 			"Restore it by checking out the snapshot's first parent and running\n" +
 			"git stash apply --index <snapshot>. Return branch custody through\n" +
 			"the structured branch_sync next_action in the output. Unlike `axi abort`,\n" +

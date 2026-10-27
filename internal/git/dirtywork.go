@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -95,6 +96,9 @@ func CaptureDirtyWork(ctx context.Context, req DirtyWorkRequest) (*DirtyWorkSnap
 
 	entries, err := porcelainEntries(ctx, wt)
 	if err != nil {
+		return nil, err
+	}
+	if err := rejectNonSnapshotable(ctx, wt); err != nil {
 		return nil, err
 	}
 	if len(entries) == 0 {
@@ -357,13 +361,6 @@ type preparedEntry struct {
 	mode string
 	tmp  string
 	link string
-}
-
-type fileStamp struct {
-	exists bool
-	mode   os.FileMode
-	size   int64
-	mod    int64
 }
 
 func worktreeDeleted(code string) bool {
@@ -926,29 +923,8 @@ func recheckDirtyWork(ctx context.Context, wt, tmp, head, indexTree, workTree, u
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	entries, err := readDirtyEntries(ctx, wt)
-	if err != nil {
+	if err := rejectNonSnapshotable(ctx, wt); err != nil {
 		return err
-	}
-	before, err := stampDirtyFiles(wt, entries)
-	if err != nil {
-		return err
-	}
-	if err := matchUntracked(ctx, wt, tmp, entries, untrackedTree); err != nil {
-		return err
-	}
-	if err := matchWorkTree(ctx, wt, tmp, workTree); err != nil {
-		return err
-	}
-	if err := untrackedSetMatches(ctx, wt, entries); err != nil {
-		return err
-	}
-	after, err := stampDirtyFiles(wt, entries)
-	if err != nil {
-		return err
-	}
-	if !sameStamps(before, after) {
-		return fmt.Errorf("checkout changed while capturing dirty work")
 	}
 	current, err := Run(ctx, wt, "rev-parse", "--verify", "HEAD")
 	if err != nil {
@@ -964,77 +940,14 @@ func recheckDirtyWork(ctx context.Context, wt, tmp, head, indexTree, workTree, u
 	if live != indexTree {
 		return fmt.Errorf("index changed while capturing dirty work")
 	}
-	return nil
+	return worktreeEqualsSnapshot(ctx, wt, tmp, workTree, untrackedTree)
 }
 
-func matchUntracked(ctx context.Context, wt, tmp string, entries []dirtyEntry, untrackedTree string) error {
-	var paths []dirtyEntry
-	for _, entry := range entries {
-		if entry.code == "??" {
-			paths = append(paths, entry)
-		}
+func worktreeEqualsSnapshot(ctx context.Context, wt, tmp, workTree, untrackedTree string) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	if untrackedTree == "" {
-		if len(paths) != 0 {
-			return fmt.Errorf("untracked files appeared while capturing dirty work")
-		}
-		return nil
-	}
-	if len(paths) == 0 {
-		return fmt.Errorf("untracked files disappeared while capturing dirty work")
-	}
-	for _, path := range paths {
-		mode, blob, err := hashLive(ctx, wt, tmp, path.rel)
-		if err != nil {
-			return err
-		}
-		wantMode, wantBlob, err := treeEntry(ctx, wt, untrackedTree, path.rel)
-		if err != nil || mode != wantMode || blob != wantBlob {
-			return fmt.Errorf("untracked files changed while capturing dirty work")
-		}
-	}
-	return nil
-}
-
-func hashLive(ctx context.Context, wt, tmp, rel string) (mode, blob string, err error) {
-	mode, tmpPath, link, err := stageSnapshot(ctx, tmp, rel, filepath.Join(wt, rel))
-	if err != nil {
-		return "", "", err
-	}
-	blob, err = hashPrepared(ctx, wt, preparedEntry{
-		dirtyEntry: dirtyEntry{rel: rel},
-		mode:       mode,
-		tmp:        tmpPath,
-		link:       link,
-	}, false)
-	if err != nil {
-		return "", "", err
-	}
-	return mode, blob, nil
-}
-
-func treeEntry(ctx context.Context, wt, tree, rel string) (mode, blob string, err error) {
-	out, err := RunRaw(ctx, wt, "ls-tree", "-z", tree, "--", filepath.ToSlash(rel))
-	if err != nil {
-		return "", "", err
-	}
-	out = bytes.TrimRight(out, "\x00")
-	if len(out) == 0 {
-		return "", "", fmt.Errorf("missing %s", rel)
-	}
-	tab := bytes.IndexByte(out, '\t')
-	if tab < 0 {
-		return "", "", fmt.Errorf("unreadable tree entry %s", rel)
-	}
-	fields := bytes.Fields(out[:tab])
-	if len(fields) < 3 {
-		return "", "", fmt.Errorf("unreadable tree entry %s", rel)
-	}
-	return string(fields[0]), string(fields[2]), nil
-}
-
-func matchWorkTree(ctx context.Context, wt, tmp, workTree string) error {
-	index := filepath.Join(tmp, "compare-index")
+	index := filepath.Join(tmp, "equal-index")
 	if err := os.WriteFile(index, nil, 0o644); err != nil {
 		return err
 	}
@@ -1042,88 +955,199 @@ func matchWorkTree(ctx context.Context, wt, tmp, workTree string) error {
 	if _, err := RunWithEnv(ctx, wt, env, "read-tree", workTree); err != nil {
 		return fmt.Errorf("read tracked snapshot: %w", err)
 	}
-	if _, err := RunWithEnv(ctx, wt, env, "update-index", "--refresh"); err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
+	if untrackedTree != "" {
+		info, err := untrackedIndexInfo(ctx, wt, untrackedTree)
+		if err != nil {
+			return err
 		}
-		return fmt.Errorf("tracked worktree changed while capturing dirty work")
+		if len(info) > 0 {
+			if _, err := runInDirWithEnvAndInput(ctx, wt, env, string(info), "update-index", "-z", "--index-info"); err != nil {
+				return fmt.Errorf("read untracked snapshot: %w", err)
+			}
+		}
 	}
-	return nil
-}
-
-func untrackedSetMatches(ctx context.Context, wt string, entries []dirtyEntry) error {
-	out, err := RunRaw(ctx, wt, "ls-files", "--others", "--exclude-standard", "-z")
+	out, err := runInDirWithEnvAndInputRaw(ctx, wt, env, "", "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames", "--ignore-submodules=none")
 	if err != nil {
 		return err
 	}
-	want := map[string]struct{}{}
-	for _, entry := range entries {
-		if entry.code == "??" {
-			want[entry.rel] = struct{}{}
-		}
+	return statusMatchesSnapshot(out)
+}
+
+func untrackedIndexInfo(ctx context.Context, wt, tree string) ([]byte, error) {
+	out, err := RunRaw(ctx, wt, "ls-tree", "-r", "-z", tree)
+	if err != nil {
+		return nil, fmt.Errorf("list untracked snapshot: %w", err)
 	}
-	live := 0
+	var info bytes.Buffer
 	for _, raw := range bytes.Split(out, []byte{0}) {
 		if len(raw) == 0 {
 			continue
 		}
-		rel, err := cleanCheckoutRel(string(raw))
-		if err != nil {
-			return err
+		tab := bytes.IndexByte(raw, '\t')
+		if tab < 0 {
+			return nil, fmt.Errorf("%w: unreadable untracked snapshot", ErrDirtyWorkRejected)
 		}
-		if _, ok := want[rel]; !ok {
-			return fmt.Errorf("untracked files changed while capturing dirty work")
+		fields := bytes.Fields(raw[:tab])
+		if len(fields) < 3 {
+			return nil, fmt.Errorf("%w: unreadable untracked snapshot", ErrDirtyWorkRejected)
 		}
-		info, err := os.Lstat(filepath.Join(wt, rel))
-		if err != nil {
-			return fmt.Errorf("untracked files changed while capturing dirty work")
-		}
-		if !snapshotableFile(info) {
-			return notSnapshotable(rel, info)
-		}
-		live++
+		info.Write(fields[0])
+		info.WriteByte(' ')
+		info.Write(fields[2])
+		info.WriteByte('\t')
+		info.Write(raw[tab+1:])
+		info.WriteByte(0)
 	}
-	if live != len(want) {
-		return fmt.Errorf("untracked files changed while capturing dirty work")
+	return info.Bytes(), nil
+}
+
+func statusMatchesSnapshot(out []byte) error {
+	for _, raw := range bytes.Split(out, []byte{0}) {
+		if len(raw) == 0 {
+			continue
+		}
+		if len(raw) < 4 || raw[2] != ' ' {
+			return fmt.Errorf("%w: unreadable status entry", ErrDirtyWorkRejected)
+		}
+		if raw[0] == '?' || raw[1] != ' ' {
+			return fmt.Errorf("checkout changed while capturing dirty work")
+		}
 	}
 	return nil
 }
 
-func stampDirtyFiles(wt string, entries []dirtyEntry) (map[string]fileStamp, error) {
-	stamps := make(map[string]fileStamp, len(entries))
-	for _, entry := range entries {
-		info, err := os.Lstat(filepath.Join(wt, entry.rel))
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				stamps[entry.rel] = fileStamp{}
-				continue
-			}
-			return nil, err
-		}
-		stamps[entry.rel] = fileStamp{
-			exists: true,
-			mode:   info.Mode(),
-			size:   info.Size(),
-			mod:    info.ModTime().UnixNano(),
-		}
+func rejectNonSnapshotable(ctx context.Context, wt string) error {
+	prefixes, err := ignoredDirPrefixes(ctx, wt)
+	if err != nil {
+		return err
 	}
-	return stamps, nil
+	var odd []string
+	err = filepath.WalkDir(wt, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(wt, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		if d.Name() == ".git" {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		slash := filepath.ToSlash(rel)
+		if hasIgnoredPrefix(prefixes, slash) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if snapshotableFile(info) {
+			return nil
+		}
+		odd = append(odd, slash)
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if len(odd) == 0 {
+		return nil
+	}
+	ignored, err := ignoredPathSet(ctx, wt, odd)
+	if err != nil {
+		return err
+	}
+	for _, rel := range odd {
+		if _, ok := ignored[rel]; ok {
+			continue
+		}
+		info, err := os.Lstat(filepath.Join(wt, filepath.FromSlash(rel)))
+		if err != nil {
+			return err
+		}
+		return notSnapshotable(rel, info)
+	}
+	return nil
 }
 
-func sameStamps(before, after map[string]fileStamp) bool {
-	if len(before) != len(after) {
-		return false
+func ignoredDirPrefixes(ctx context.Context, wt string) ([]string, error) {
+	out, err := RunRaw(ctx, wt, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z")
+	if err != nil {
+		return nil, err
 	}
-	for rel, stamp := range before {
-		other, ok := after[rel]
-		if !ok || stamp != other {
-			return false
+	var prefixes []string
+	for _, raw := range bytes.Split(out, []byte{0}) {
+		if len(raw) == 0 || raw[len(raw)-1] != '/' {
+			continue
+		}
+		prefixes = append(prefixes, filepath.ToSlash(string(raw[:len(raw)-1])))
+	}
+	return prefixes, nil
+}
+
+func hasIgnoredPrefix(prefixes []string, slash string) bool {
+	for _, prefix := range prefixes {
+		if slash == prefix || strings.HasPrefix(slash, prefix+"/") {
+			return true
 		}
 	}
-	return true
+	return false
+}
+
+func ignoredPathSet(ctx context.Context, wt string, paths []string) (map[string]struct{}, error) {
+	var input bytes.Buffer
+	for _, rel := range paths {
+		input.WriteString(rel)
+		input.WriteByte(0)
+	}
+	cmd := exec.CommandContext(ctx, "git", "check-ignore", "-z", "--stdin")
+	cmd.Dir = wt
+	cmd.Stdin = &input
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	cmd.Env = nonInteractiveEnvForContext(ctx, wt)
+	winproc.Harden(cmd)
+	shellenv.ConfigureShellCommand(cmd)
+	out, err := shellenv.OutputShellCommand(cmd)
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return map[string]struct{}{}, nil
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, fmt.Errorf("check ignored paths: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	ignored := make(map[string]struct{})
+	for _, raw := range bytes.Split(out, []byte{0}) {
+		if len(raw) == 0 {
+			continue
+		}
+		ignored[filepath.ToSlash(string(raw))] = struct{}{}
+	}
+	return ignored, nil
 }
 
 func assertCheckoutClean(ctx context.Context, wt string) error {
+	if err := rejectNonSnapshotable(ctx, wt); err != nil {
+		return err
+	}
 	entries, err := readDirtyEntries(ctx, wt)
 	if err != nil {
 		return err
