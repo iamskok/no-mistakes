@@ -441,8 +441,28 @@ func readerContainsSecret(ctx context.Context, r io.Reader) (bool, error) {
 	return writeReaderScan(ctx, io.Discard, r)
 }
 
-func writeReaderScan(ctx context.Context, dst io.Writer, r io.Reader) (bool, error) {
+// absorbSecretChunk reports whether tail+chunk holds a private-key marker and
+// returns the overlap that the next chunk must be checked against. The file
+// reader and the staged-blob scanner both use it, so a marker split across
+// reads is classified the same way on either path.
+func absorbSecretChunk(tail, chunk []byte) (next []byte, found bool) {
+	if len(chunk) == 0 {
+		return tail, false
+	}
+	window := make([]byte, 0, len(tail)+len(chunk))
+	window = append(window, tail...)
+	window = append(window, chunk...)
+	if bytesContainSecret(window) {
+		return nil, true
+	}
 	overlap := secretMarkerOverlap()
+	if len(window) > overlap {
+		return append([]byte(nil), window[len(window)-overlap:]...), false
+	}
+	return append([]byte(nil), window...), false
+}
+
+func writeReaderScan(ctx context.Context, dst io.Writer, r io.Reader) (bool, error) {
 	buf := make([]byte, secretReadChunk)
 	var tail []byte
 	for {
@@ -454,16 +474,10 @@ func writeReaderScan(ctx context.Context, dst io.Writer, r io.Reader) (bool, err
 			if _, werr := dst.Write(buf[:n]); werr != nil {
 				return false, werr
 			}
-			window := make([]byte, 0, len(tail)+n)
-			window = append(window, tail...)
-			window = append(window, buf[:n]...)
-			if bytesContainSecret(window) {
+			var found bool
+			tail, found = absorbSecretChunk(tail, buf[:n])
+			if found {
 				return true, nil
-			}
-			if len(window) > overlap {
-				tail = append([]byte(nil), window[len(window)-overlap:]...)
-			} else {
-				tail = append([]byte(nil), window...)
 			}
 		}
 		if errors.Is(err, io.EOF) {
@@ -629,6 +643,36 @@ func zeroSHA(sha string) bool {
 	return true
 }
 
+// errSecretScanStop ends the stdout copy once a private-key marker is in hand.
+// The shell runner treats it as a copy failure and reaps git; the caller
+// reports the marker instead of this error.
+var errSecretScanStop = errors.New("secret scan stop")
+
+// secretStreamScanner is the stdout sink for a git blob read. RunShellCommand
+// owns the pipe: it resumes a Windows process that ConfigureShellCommand
+// starts suspended, copies until git closes the stream, and reaps any
+// descendant still holding that pipe when the leader exits. Reading the pipe
+// to completion before Wait never observes that close, so the scan blocks
+// until the test process is killed.
+type secretStreamScanner struct {
+	ctx   context.Context
+	tail  []byte
+	found bool
+}
+
+func (s *secretStreamScanner) Write(p []byte) (int, error) {
+	var found bool
+	s.tail, found = absorbSecretChunk(s.tail, p)
+	if found {
+		s.found = true
+		return len(p), errSecretScanStop
+	}
+	if err := s.ctx.Err(); err != nil {
+		return len(p), err
+	}
+	return len(p), nil
+}
+
 func gitStreamContainsSecret(ctx context.Context, dir string, args ...string) (bool, error) {
 	if isBareGitDir(dir) {
 		args = append([]string{"--git-dir=" + dir}, args...)
@@ -636,38 +680,21 @@ func gitStreamContainsSecret(ctx context.Context, dir string, args ...string) (b
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	cmd.Env = nonInteractiveEnvForContext(ctx, dir)
-	winproc.Harden(cmd)
-	shellenv.ConfigureShellCommand(cmd)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return false, err
-	}
+	scan := &secretStreamScanner{ctx: ctx}
+	cmd.Stdout = scan
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
-		return false, err
-	}
-	found, readErr := readerContainsSecret(ctx, stdout)
-	if found || readErr != nil {
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
-	}
-	waitErr := cmd.Wait()
-	if readErr != nil {
-		if ctx.Err() != nil {
-			return false, ctx.Err()
-		}
-		return false, readErr
-	}
-	if found {
+	winproc.Harden(cmd)
+	shellenv.ConfigureShellCommand(cmd)
+	err := shellenv.RunShellCommand(cmd)
+	if scan.found {
 		return true, nil
 	}
-	if waitErr != nil {
+	if err != nil {
 		if ctx.Err() != nil {
 			return false, ctx.Err()
 		}
-		return false, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), waitErr, strings.TrimSpace(stderr.String()))
+		return false, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
 	return false, nil
 }
