@@ -1013,8 +1013,9 @@ func removeOrphanWorktree(ctx context.Context, wt orphanWorktree) bool {
 // all (e.g. a directory left behind after its run row was independently
 // pruned) are eligible for removal. RunManager.startRun always inserts the
 // run row before creating the worktree directory, so on a single daemon a
-// "no matching run" directory is never one whose insert simply hasn't landed
-// yet - it is safe to remove immediately.
+// "no matching run" directory is eligible immediately: its insert has already
+// landed or the row is gone. removeOrphanWorktree keeps a checkout whose
+// unique uncommitted work cannot be snapshotted.
 //
 // A run marked RunCIMonitorInterrupted (the daemon restarted while monitoring
 // CI for an already-open PR, issue #361) is terminal and would otherwise leak

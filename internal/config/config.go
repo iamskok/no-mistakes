@@ -1324,14 +1324,17 @@ type WorktreeRaw struct {
 	MaxRuns   *int    `yaml:"max_runs"`
 }
 
-// Worktree is the resolved local run-worktree retention config. A run's own
-// worktree is already removed the instant its pipeline finishes (see
-// daemon.RunManager.removeRunWorktree); this bounds what a failed removal -
-// or a protected-path refusal that later became removable - leaves behind, on
-// a long-lived daemon that may not restart for weeks (see
-// daemon.cleanupOrphanWorktrees for the crash-recovery counterpart, which
-// runs only at startup). Zero Retention disables age-based reaping and zero
-// MaxRuns disables the count ceiling, matching Evidence.
+// Worktree is the resolved local run-worktree retention config. A finished
+// run removes its worktree after a verified snapshot of unique uncommitted
+// work, or when the checkout is clean (see daemon.RunManager.removeRunWorktree);
+// this bounds what a failed removal, a protected-path refusal that later
+// became removable, or a checkout kept because that snapshot could not be
+// made leaves behind, on a long-lived daemon that may not restart for weeks
+// (see daemon.cleanupOrphanWorktrees for the crash-recovery counterpart,
+// which runs only at startup). A later reap leaves a checkout whose snapshot
+// cannot be made. Zero Retention disables age-based reaping and zero MaxRuns
+// disables the count ceiling, matching Evidence. The removal rule is owned
+// by docs/src/content/docs/concepts/daemon.md.
 type Worktree struct {
 	Retention time.Duration
 	MaxRuns   int
@@ -1702,13 +1705,16 @@ log_level: info
 # worktree_roots:
 #   /Users/you/src/my-repo: /Users/you/work/my-repo-runs
 
-# A run's own worktree is already removed the instant its pipeline finishes.
-# This bounds what a rare failed removal - or a protected-path refusal that
-# later became removable - leaves behind, the same way test.evidence.retention
-# bounds evidence: retention ages leftover directories out (default 24 hours)
-# and max_runs caps how many survive regardless of age (default 20). Set
-# retention to "unlimited", or either to 0, to disable that bound. Global-only,
-# like test.evidence's retention settings.
+# A finished run removes its worktree after a verified snapshot of unique
+# uncommitted work, or when the checkout is clean. This bounds what a rare
+# failed removal, a protected-path refusal that later became removable, or a
+# checkout kept because that snapshot could not be made leaves behind. A later
+# reap leaves the checkout in place while the snapshot cannot be made.
+# Retention ages leftover directories out (default 24 hours) and max_runs caps
+# how many survive regardless of age (default 20), the same way
+# test.evidence.retention bounds evidence. Set retention to "unlimited", or
+# either to 0, to disable that bound. Global-only, like test.evidence's
+# retention settings.
 # worktree:
 #   retention: 24h
 #   max_runs: 20
