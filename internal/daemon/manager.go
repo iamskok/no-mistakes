@@ -748,18 +748,24 @@ func (m *RunManager) removeRunWorktree(repoID, runID, gateDir, wtDir, reason str
 			runID = run.ID
 		}
 	}
-	snap, err := captureDirtyWorkBeforeRemoval(gateDir, wtDir, runID, baseSHA)
-	if err != nil {
-		slog.Warn("preserving run worktree: unique uncommitted work was not captured", "run_id", runID, "path", wtDir, "reason", reason, "error", err)
-		return
-	}
-	if err := confirmDirtyWorkBeforeRemoval(wtDir, snap); err != nil {
-		slog.Warn("preserving run worktree: checkout changed after the dirty work snapshot", "run_id", runID, "path", wtDir, "reason", reason, "error", err)
-		return
-	}
-	if err := git.WorktreeRemove(context.Background(), gateDir, wtDir); err != nil {
-		slog.Warn("failed to remove run worktree", "reason", reason, "run_id", runID, "path", wtDir, "error", err)
-	}
+	// The lock covers capture through removal. Releasing it before deletion
+	// lets a second pass snapshot a newer edit, delete the checkout, and
+	// then lose that snapshot when this pass publishes the older ref.
+	_ = git.WithDirtyWorkCheckout(wtDir, func() error {
+		snap, err := captureDirtyWorkBeforeRemoval(gateDir, wtDir, runID, baseSHA)
+		if err != nil {
+			slog.Warn("preserving run worktree: unique uncommitted work was not captured", "run_id", runID, "path", wtDir, "reason", reason, "error", err)
+			return err
+		}
+		if err := confirmDirtyWorkBeforeRemoval(wtDir, snap); err != nil {
+			slog.Warn("preserving run worktree: checkout changed after the dirty work snapshot", "run_id", runID, "path", wtDir, "reason", reason, "error", err)
+			return err
+		}
+		if err := git.WorktreeRemove(context.Background(), gateDir, wtDir); err != nil {
+			slog.Warn("failed to remove run worktree", "reason", reason, "run_id", runID, "path", wtDir, "error", err)
+		}
+		return nil
+	})
 }
 
 // closeSubscribers soft-closes every subscriber for a run and marks the run

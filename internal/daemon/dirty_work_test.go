@@ -124,7 +124,7 @@ func TestRemoveRunWorktreeRemovesSymlinkCheckout(t *testing.T) {
 		{"dangling", "missing-target"},
 	} {
 		got, err := os.Readlink(filepath.Join(restored, tc.name))
-		if err != nil || got != tc.want {
+		if err != nil || filepath.ToSlash(got) != filepath.ToSlash(tc.want) {
 			t.Fatalf("restored %s = %q, %v; want %q", tc.name, got, err, tc.want)
 		}
 	}

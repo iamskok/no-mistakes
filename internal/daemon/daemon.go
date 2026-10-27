@@ -984,25 +984,34 @@ func confirmDirtyWorkBeforeRemoval(wtDir string, snap *git.DirtyWorkSnapshot) er
 // A capture failure returns false with the directory left in place.
 func removeOrphanWorktree(ctx context.Context, wt orphanWorktree) bool {
 	gateDir, wtPath := wt.gateDir, wt.dir
-	snap, err := captureDirtyWorkBeforeRemoval(gateDir, wtPath, wt.runID, wt.baseSHA)
-	if err != nil {
-		slog.Warn("preserving orphan worktree: unique uncommitted work was not captured", "path", wtPath, "run_id", wt.runID, "error", err)
-		return false
-	}
-	if err := confirmDirtyWorkBeforeRemoval(wtPath, snap); err != nil {
-		slog.Warn("preserving orphan worktree: checkout changed after the dirty work snapshot", "path", wtPath, "run_id", wt.runID, "error", err)
-		return false
-	}
-	if err := git.WorktreeRemove(ctx, gateDir, wtPath); err != nil {
-		slog.Warn("git worktree remove failed, falling back to os.RemoveAll", "path", wtPath, "error", err)
-		if err := os.RemoveAll(wtPath); err != nil {
-			slog.Warn("failed to remove orphaned worktree", "path", wtPath, "error", err)
-			return false
+	removed := false
+	// Same checkout lock as removeRunWorktree: capture through removal.
+	err := git.WithDirtyWorkCheckout(wtPath, func() error {
+		snap, err := captureDirtyWorkBeforeRemoval(gateDir, wtPath, wt.runID, wt.baseSHA)
+		if err != nil {
+			slog.Warn("preserving orphan worktree: unique uncommitted work was not captured", "path", wtPath, "run_id", wt.runID, "error", err)
+			return err
 		}
-	} else {
-		slog.Info("removed orphaned worktree", "path", wtPath)
+		if err := confirmDirtyWorkBeforeRemoval(wtPath, snap); err != nil {
+			slog.Warn("preserving orphan worktree: checkout changed after the dirty work snapshot", "path", wtPath, "run_id", wt.runID, "error", err)
+			return err
+		}
+		if err := git.WorktreeRemove(ctx, gateDir, wtPath); err != nil {
+			slog.Warn("git worktree remove failed, falling back to os.RemoveAll", "path", wtPath, "error", err)
+			if err := os.RemoveAll(wtPath); err != nil {
+				slog.Warn("failed to remove orphaned worktree", "path", wtPath, "error", err)
+				return err
+			}
+		} else {
+			slog.Info("removed orphaned worktree", "path", wtPath)
+		}
+		removed = true
+		return nil
+	})
+	if err != nil {
+		return false
 	}
-	return true
+	return removed
 }
 
 // skipWorktreeCleanup reports whether the worktree directory for runID must

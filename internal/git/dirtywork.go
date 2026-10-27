@@ -5,12 +5,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/kunchenguid/no-mistakes/internal/shellenv"
 	"github.com/kunchenguid/no-mistakes/internal/winproc"
@@ -94,7 +96,7 @@ func CaptureDirtyWork(ctx context.Context, req DirtyWorkRequest) (*DirtyWorkSnap
 		return nil, err
 	}
 
-	entries, err := porcelainEntries(ctx, wt)
+	entries, err := checkoutDirtyEntries(ctx, wt)
 	if err != nil {
 		return nil, err
 	}
@@ -175,7 +177,7 @@ func RestoreDirtyWork(ctx context.Context, worktree, commit string) error {
 	if current != head {
 		return fmt.Errorf("checkout HEAD %s is not the snapshot head %s", current, head)
 	}
-	if _, err := Run(ctx, worktree, "stash", "apply", "--index", commit); err != nil {
+	if _, err := Run(ctx, worktree, withSymlinks("stash", "apply", "--index", commit)...); err != nil {
 		return fmt.Errorf("apply dirty work snapshot: %w", err)
 	}
 	return nil
@@ -209,15 +211,222 @@ func parsePorcelainZ(out []byte) ([]dirtyEntry, error) {
 }
 
 func porcelainEntries(ctx context.Context, wt string) ([]dirtyEntry, error) {
-	status, err := RunRaw(ctx, wt, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames", "--ignore-submodules=none")
+	status, err := RunRaw(ctx, wt, gitStatusArgs()...)
 	if err != nil {
 		return nil, err
 	}
 	return parsePorcelainZ(status)
 }
 
-func readDirtyEntries(ctx context.Context, wt string) ([]dirtyEntry, error) {
+// checkoutDirtyEntries is the status list plus tracked edits that status hides.
+// assume-unchanged and skip-worktree keep a real worktree change out of
+// porcelain, and both the clean short-circuit and the pre-removal check
+// read this list.
+func checkoutDirtyEntries(ctx context.Context, wt string) ([]dirtyEntry, error) {
 	entries, err := porcelainEntries(ctx, wt)
+	if err != nil {
+		return nil, err
+	}
+	return appendHiddenTrackedEdits(ctx, wt, entries)
+}
+
+func gitStatusArgs() []string {
+	return withSymlinks("status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames", "--ignore-submodules=none")
+}
+
+// withSymlinks forces symlink comparison. Windows git defaults
+// core.symlinks off, which reads a real symlink as a mismatch or as a
+// plain file and then refuses the snapshot or restores the link text as
+// a regular file.
+func withSymlinks(args ...string) []string {
+	out := make([]string, 0, len(args)+2)
+	out = append(out, "-c", "core.symlinks=true")
+	out = append(out, args...)
+	return out
+}
+
+// statusHidesWorktree reports tags from git ls-files -v whose worktree
+// changes do not appear in git status. Skip-worktree is S; assume-unchanged
+// is any lowercase tag, including s when both bits are set.
+func statusHidesWorktree(tag byte) bool {
+	if tag == 'S' {
+		return true
+	}
+	return tag >= 'a' && tag <= 'z'
+}
+
+func appendHiddenTrackedEdits(ctx context.Context, wt string, entries []dirtyEntry) ([]dirtyEntry, error) {
+	out, err := RunRaw(ctx, wt, "ls-files", "-v", "-z")
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]int, len(entries))
+	for i := range entries {
+		seen[filepath.ToSlash(entries[i].rel)] = i
+	}
+	for _, raw := range bytes.Split(out, []byte{0}) {
+		if len(raw) < 3 || raw[1] != ' ' || !statusHidesWorktree(raw[0]) {
+			continue
+		}
+		rel := string(raw[2:])
+		differs, exists, err := trackedPathDiffers(ctx, wt, rel)
+		if err != nil {
+			return nil, err
+		}
+		if !differs {
+			continue
+		}
+		slash := filepath.ToSlash(rel)
+		if i, ok := seen[slash]; ok {
+			entries[i].code = overlayHiddenWorktree(entries[i].code, exists)
+			continue
+		}
+		code := " M"
+		if !exists {
+			code = " D"
+		}
+		entries = append(entries, dirtyEntry{code: code, rel: rel})
+		seen[slash] = len(entries) - 1
+	}
+	return entries, nil
+}
+
+func overlayHiddenWorktree(code string, exists bool) string {
+	if len(code) != 2 || code[1] != ' ' {
+		return code
+	}
+	col := byte('M')
+	if !exists {
+		col = 'D'
+	}
+	return string([]byte{code[0], col})
+}
+
+func trackedPathDiffers(ctx context.Context, wt, rel string) (differs, exists bool, err error) {
+	full := filepath.Join(wt, filepath.FromSlash(rel))
+	info, lerr := os.Lstat(full)
+	if lerr != nil {
+		if errors.Is(lerr, os.ErrNotExist) {
+			return true, false, nil
+		}
+		return false, false, lerr
+	}
+	mode, sha, single, err := indexBlob(ctx, wt, rel)
+	if err != nil {
+		return false, true, err
+	}
+	if !single {
+		return true, true, nil
+	}
+	workMode, workSHA, err := worktreeBlob(ctx, wt, rel, full, info)
+	if err != nil {
+		if errors.Is(err, errNotRegular) {
+			return true, true, nil
+		}
+		return false, true, err
+	}
+	return mode != workMode || sha != workSHA, true, nil
+}
+
+func indexBlob(ctx context.Context, wt, rel string) (mode, sha string, single bool, err error) {
+	out, err := RunRaw(ctx, wt, "ls-files", "--stage", "-z", "--", rel)
+	if err != nil {
+		return "", "", false, err
+	}
+	n := 0
+	for _, raw := range bytes.Split(out, []byte{0}) {
+		if len(raw) == 0 {
+			continue
+		}
+		tab := bytes.IndexByte(raw, '\t')
+		if tab < 0 {
+			return "", "", false, fmt.Errorf("%w: unreadable index entry", ErrDirtyWorkRejected)
+		}
+		fields := bytes.Fields(raw[:tab])
+		if len(fields) < 3 {
+			return "", "", false, fmt.Errorf("%w: unreadable index entry", ErrDirtyWorkRejected)
+		}
+		if string(fields[2]) != "0" {
+			return "", "", false, nil
+		}
+		mode = string(fields[0])
+		sha = string(fields[1])
+		n++
+	}
+	if n != 1 {
+		return "", "", false, nil
+	}
+	return mode, sha, true, nil
+}
+
+func worktreeBlob(ctx context.Context, wt, rel, full string, info os.FileInfo) (mode, sha string, err error) {
+	if info.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Readlink(full)
+		if err != nil {
+			return "", "", err
+		}
+		sha, err = runInDirWithEnvAndInput(ctx, wt, nil, filepath.ToSlash(target), "hash-object", "--stdin")
+		if err != nil {
+			return "", "", err
+		}
+		return "120000", sha, nil
+	}
+	if !info.Mode().IsRegular() {
+		return "", "", errNotRegular
+	}
+	mode = "100644"
+	if info.Mode()&0o111 != 0 {
+		mode = "100755"
+	}
+	sha, err = Run(ctx, wt, "hash-object", "--path="+filepath.ToSlash(rel), "--", full)
+	return mode, sha, err
+}
+
+// dirtyWorkLocks stripes checkouts so two cleanups of one path cannot
+// interleave, without retaining a mutex per path for the life of the daemon.
+const dirtyWorkLockStripes = 64
+
+var dirtyWorkLocks [dirtyWorkLockStripes]sync.Mutex
+
+// dirtyWorkBeforeLock and dirtyWorkBeforeRefUpdate are test seams. The lock
+// hook runs before the checkout mutex is taken. The ref hook runs after the
+// snapshot matches and before update-ref, while the cleanup lock is held.
+var (
+	dirtyWorkBeforeLock      func()
+	dirtyWorkBeforeRefUpdate func()
+)
+
+func dirtyWorkMu(worktree string) *sync.Mutex {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(canonicalPath(worktree)))
+	return &dirtyWorkLocks[h.Sum32()%dirtyWorkLockStripes]
+}
+
+func dirtyWorkCheckoutLocked(worktree string) bool {
+	mu := dirtyWorkMu(worktree)
+	if mu.TryLock() {
+		mu.Unlock()
+		return false
+	}
+	return true
+}
+
+// WithDirtyWorkCheckout serializes snapshot and removal of one checkout.
+// Callers hold it across capture, the pre-removal recheck, and deletion so
+// an older pass paused before publishing cannot replace the ref written by
+// the pass that already deleted the checkout.
+func WithDirtyWorkCheckout(worktree string, fn func() error) error {
+	if dirtyWorkBeforeLock != nil {
+		dirtyWorkBeforeLock()
+	}
+	mu := dirtyWorkMu(worktree)
+	mu.Lock()
+	defer mu.Unlock()
+	return fn()
+}
+
+func readDirtyEntries(ctx context.Context, wt string) ([]dirtyEntry, error) {
+	entries, err := checkoutDirtyEntries(ctx, wt)
 	if err != nil || len(entries) == 0 {
 		return nil, err
 	}
@@ -312,7 +521,7 @@ func gitCommonDir(ctx context.Context, dir string) (string, error) {
 
 func assertPathOwned(root, full string) error {
 	parent := filepath.Dir(full)
-	resolvedParent, err := filepath.EvalSymlinks(parent)
+	resolvedParent, err := nearestExistingPath(parent)
 	if err != nil {
 		return fmt.Errorf("%s escapes the checkout", filepath.Base(full))
 	}
@@ -338,6 +547,37 @@ func assertPathOwned(root, full string) error {
 		return fmt.Errorf("%s escapes the checkout", filepath.Base(full))
 	}
 	return nil
+}
+
+// nearestExistingPath resolves path, walking up to the nearest existing
+// ancestor when a tracked directory has been deleted. The missing suffix is
+// joined lexically onto that ancestor, so ownership is the ancestor's real
+// location plus the deleted names, and a symlink ancestor still resolves.
+func nearestExistingPath(path string) (string, error) {
+	var missing []string
+	cur := path
+	for {
+		_, err := os.Lstat(cur)
+		if err == nil {
+			resolved, evalErr := filepath.EvalSymlinks(cur)
+			if evalErr != nil {
+				return "", evalErr
+			}
+			for i := len(missing) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missing[i])
+			}
+			return resolved, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return "", err
+		}
+		missing = append(missing, filepath.Base(cur))
+		cur = parent
+	}
 }
 
 func cleanCheckoutRel(rel string) (string, error) {
@@ -539,7 +779,7 @@ func stageSnapshot(ctx context.Context, tmpDir, rel, full string) (mode, tmpPath
 		if bytesContainSecret([]byte(target)) {
 			return "", "", "", fmt.Errorf("%w: %s is secret-bearing", ErrDirtyWorkRejected, rel)
 		}
-		return "120000", "", target, nil
+		return "120000", "", filepath.ToSlash(target), nil
 	}
 	if !info.Mode().IsRegular() {
 		return "", "", "", notSnapshotable(rel, info)
@@ -794,6 +1034,9 @@ func writeDirtySnapshot(ctx context.Context, req DirtyWorkRequest, ref string, e
 	if err := recheckDirtyWork(ctx, wt, tmp, head, indexTree, workTree, untrackedTree); err != nil {
 		return nil, err
 	}
+	if dirtyWorkBeforeRefUpdate != nil {
+		dirtyWorkBeforeRefUpdate()
+	}
 	if _, err := Run(ctx, req.GateDir, "update-ref", ref, commit); err != nil {
 		return nil, fmt.Errorf("record dirty work snapshot: %w", err)
 	}
@@ -993,7 +1236,7 @@ func worktreeEqualsSnapshot(ctx context.Context, wt, tmp, workTree, untrackedTre
 			}
 		}
 	}
-	out, err := runInDirWithEnvAndInputRaw(ctx, wt, env, "", "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames", "--ignore-submodules=none")
+	out, err := runInDirWithEnvAndInputRaw(ctx, wt, env, "", gitStatusArgs()...)
 	if err != nil {
 		return err
 	}

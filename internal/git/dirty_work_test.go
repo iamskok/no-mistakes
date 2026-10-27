@@ -8,7 +8,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 const dirtyWorkRunID = "01JZ8XQ7V6K9M3B0T5N2R4C8YD"
@@ -253,7 +256,7 @@ func TestCaptureDirtyWork_SnapshotsSymlinkText(t *testing.T) {
 		if err != nil {
 			t.Fatalf("readlink %s: %v", tc.name, err)
 		}
-		if got != tc.want {
+		if filepath.ToSlash(got) != filepath.ToSlash(tc.want) {
 			t.Fatalf("restored %s = %q, want %q", tc.name, got, tc.want)
 		}
 	}
@@ -444,6 +447,212 @@ func TestCaptureDirtyWork_RejectsUnrelatedHome(t *testing.T) {
 	if _, err := Run(ctx, gate, "rev-parse", "--verify", "--quiet", DirtyWorkRef(dirtyWorkRunID)); err == nil {
 		t.Fatal("rejected capture published a snapshot ref")
 	}
+}
+
+func TestCaptureDirtyWork_SnapshotsEditsHiddenFromStatus(t *testing.T) {
+	for _, flag := range []string{"--assume-unchanged", "--skip-worktree"} {
+		t.Run(flag, func(t *testing.T) {
+			ctx := context.Background()
+			gate, wt, head, _ := newDirtyWorkGate(t, "hidden")
+			run(t, wt, "git", "update-index", flag, "--", "file.txt")
+			if snap, err := CaptureDirtyWork(ctx, DirtyWorkRequest{GateDir: gate, Worktree: wt, RunID: dirtyWorkRunID}); err != nil || snap != nil {
+				t.Fatalf("unmodified %s capture = %#v, %v", flag, snap, err)
+			}
+			if err := DirtyWorkStillMatches(ctx, wt, nil); err != nil {
+				t.Fatalf("unmodified %s looked dirty: %v", flag, err)
+			}
+
+			writeFile(t, filepath.Join(wt, "file.txt"), "hidden edit\n")
+			if got := strings.TrimSpace(run(t, wt, "git", "status", "--porcelain")); got != "" {
+				t.Fatalf("status showed the hidden edit: %q", got)
+			}
+			if err := DirtyWorkStillMatches(ctx, wt, nil); err == nil {
+				t.Fatal("nil snapshot matched a hidden edit")
+			}
+			snap, err := CaptureDirtyWork(ctx, DirtyWorkRequest{GateDir: gate, Worktree: wt, RunID: dirtyWorkRunID})
+			if err != nil || snap == nil {
+				t.Fatalf("capture = %#v, %v", snap, err)
+			}
+			if err := WorktreeRemove(ctx, gate, wt); err != nil {
+				t.Fatal(err)
+			}
+			restored := filepath.Join(t.TempDir(), "restored-hidden")
+			if err := WorktreeAdd(ctx, gate, restored, head); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = WorktreeRemove(ctx, gate, restored) })
+			if err := RestoreDirtyWork(ctx, restored, snap.Commit); err != nil {
+				t.Fatal(err)
+			}
+			if got := string(mustRead(t, filepath.Join(restored, "file.txt"))); got != "hidden edit\n" {
+				t.Fatalf("restored file.txt = %q", got)
+			}
+		})
+	}
+
+	t.Run("deleted", func(t *testing.T) {
+		ctx := context.Background()
+		gate, wt, head, _ := newDirtyWorkGate(t, "hidden-delete")
+		run(t, wt, "git", "update-index", "--assume-unchanged", "--", "file.txt")
+		if err := os.Remove(filepath.Join(wt, "file.txt")); err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.TrimSpace(run(t, wt, "git", "status", "--porcelain")); got != "" {
+			t.Fatalf("status showed the hidden deletion: %q", got)
+		}
+		if err := DirtyWorkStillMatches(ctx, wt, nil); err == nil {
+			t.Fatal("nil snapshot matched a hidden deletion")
+		}
+		snap, err := CaptureDirtyWork(ctx, DirtyWorkRequest{GateDir: gate, Worktree: wt, RunID: dirtyWorkRunID})
+		if err != nil || snap == nil {
+			t.Fatalf("capture = %#v, %v", snap, err)
+		}
+		if err := WorktreeRemove(ctx, gate, wt); err != nil {
+			t.Fatal(err)
+		}
+		restored := filepath.Join(t.TempDir(), "restored-hidden-delete")
+		if err := WorktreeAdd(ctx, gate, restored, head); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = WorktreeRemove(ctx, gate, restored) })
+		if err := RestoreDirtyWork(ctx, restored, snap.Commit); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(filepath.Join(restored, "file.txt")); !os.IsNotExist(err) {
+			t.Fatalf("hidden deletion was restored as a file: %v", err)
+		}
+	})
+}
+
+func TestCaptureDirtyWork_SnapshotsDeletedTrackedDirectory(t *testing.T) {
+	ctx := context.Background()
+	gate, wt, head, _ := newDirtyWorkGate(t, "rmdir")
+	if err := os.RemoveAll(filepath.Join(wt, "sub dir")); err != nil {
+		t.Fatal(err)
+	}
+	status := run(t, wt, "git", "status", "--porcelain")
+	if !strings.Contains(status, "sub dir/a b.txt") {
+		t.Fatalf("status = %q, want the deleted tracked file", status)
+	}
+	snap, err := CaptureDirtyWork(ctx, DirtyWorkRequest{GateDir: gate, Worktree: wt, RunID: dirtyWorkRunID})
+	if err != nil || snap == nil {
+		t.Fatalf("capture = %#v, %v", snap, err)
+	}
+	if err := WorktreeRemove(ctx, gate, wt); err != nil {
+		t.Fatal(err)
+	}
+	restored := filepath.Join(t.TempDir(), "restored-rmdir")
+	if err := WorktreeAdd(ctx, gate, restored, head); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = WorktreeRemove(ctx, gate, restored) })
+	if err := RestoreDirtyWork(ctx, restored, snap.Commit); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(restored, "sub dir", "a b.txt")); !os.IsNotExist(err) {
+		t.Fatalf("deleted directory file came back: %v", err)
+	}
+}
+
+func TestDirtyWorkCleanup_OlderPassCannotReplaceNewerSnapshot(t *testing.T) {
+	ctx := context.Background()
+	gate, wt, head, _ := newDirtyWorkGate(t, "serialize")
+	writeFile(t, filepath.Join(wt, "file.txt"), "version-a\n")
+
+	releaseA := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseA) }) }
+	t.Cleanup(release)
+
+	prevLock := dirtyWorkBeforeLock
+	prevUpdate := dirtyWorkBeforeRefUpdate
+	t.Cleanup(func() {
+		dirtyWorkBeforeLock = prevLock
+		dirtyWorkBeforeRefUpdate = prevUpdate
+	})
+
+	var arrivals atomic.Int32
+	dirtyWorkBeforeLock = func() { arrivals.Add(1) }
+	aAtPublish := make(chan struct{})
+	var once sync.Once
+	dirtyWorkBeforeRefUpdate = func() {
+		once.Do(func() {
+			close(aAtPublish)
+			<-releaseA
+		})
+	}
+
+	type result struct{ err error }
+	aDone := make(chan result, 1)
+	go func() {
+		aDone <- result{err: removeLockedDirtyCheckout(ctx, gate, wt, dirtyWorkRunID)}
+	}()
+	select {
+	case <-aAtPublish:
+	case res := <-aDone:
+		t.Fatalf("first pass finished before publish: %v", res.err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("first pass did not reach publish")
+	}
+
+	writeFile(t, filepath.Join(wt, "file.txt"), "version-b\n")
+	bDone := make(chan result, 1)
+	go func() {
+		bDone <- result{err: removeLockedDirtyCheckout(ctx, gate, wt, dirtyWorkRunID)}
+	}()
+	deadline := time.Now().Add(30 * time.Second)
+	for arrivals.Load() < 2 {
+		if time.Now().After(deadline) {
+			release()
+			t.Fatal("second cleanup did not reach the checkout lock")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !dirtyWorkCheckoutLocked(wt) {
+		release()
+		t.Fatal("first cleanup was not holding the checkout when the second arrived")
+	}
+	release()
+
+	var aRes, bRes result
+	select {
+	case aRes = <-aDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("first pass did not finish")
+	}
+	select {
+	case bRes = <-bDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("second pass did not finish")
+	}
+	if _, err := os.Stat(wt); !os.IsNotExist(err) {
+		t.Fatalf("checkout still present: %v (first %v, second %v)", err, aRes.err, bRes.err)
+	}
+	commit := run(t, gate, "git", "rev-parse", "--verify", DirtyWorkRef(dirtyWorkRunID)+"^{commit}")
+	restored := filepath.Join(t.TempDir(), "restored-serialize")
+	if err := WorktreeAdd(ctx, gate, restored, head); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = WorktreeRemove(ctx, gate, restored) })
+	if err := RestoreDirtyWork(ctx, restored, commit); err != nil {
+		t.Fatalf("restore: %v (first %v, second %v)", err, aRes.err, bRes.err)
+	}
+	if got := string(mustRead(t, filepath.Join(restored, "file.txt"))); got != "version-b\n" {
+		t.Fatalf("restored file.txt = %q, want version-b (first %v, second %v)", got, aRes.err, bRes.err)
+	}
+}
+
+func removeLockedDirtyCheckout(ctx context.Context, gate, wt, runID string) error {
+	return WithDirtyWorkCheckout(wt, func() error {
+		snap, err := CaptureDirtyWork(ctx, DirtyWorkRequest{GateDir: gate, Worktree: wt, RunID: runID})
+		if err != nil {
+			return err
+		}
+		if err := DirtyWorkStillMatches(ctx, wt, snap); err != nil {
+			return err
+		}
+		return WorktreeRemove(ctx, gate, wt)
+	})
 }
 
 func newDirtyWorkGate(t *testing.T, wtName string) (gate, wt, head, base string) {
