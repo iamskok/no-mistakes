@@ -952,16 +952,24 @@ const dirtyWorkCaptureTimeout = 5 * time.Minute
 // captureDirtyWorkBeforeRemoval records unique uncommitted work in the gate
 // before a checkout is deleted. A nil error means the checkout was clean or
 // the snapshot was verified. Any error means the caller must not delete it.
-func captureDirtyWorkBeforeRemoval(gateDir, wtDir, runID, baseSHA string) error {
+func captureDirtyWorkBeforeRemoval(gateDir, wtDir, runID, baseSHA string) (*git.DirtyWorkSnapshot, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), dirtyWorkCaptureTimeout)
 	defer cancel()
-	_, err := git.CaptureDirtyWork(ctx, git.DirtyWorkRequest{
+	return git.CaptureDirtyWork(ctx, git.DirtyWorkRequest{
 		GateDir:  gateDir,
 		Worktree: wtDir,
 		RunID:    runID,
 		BaseSHA:  baseSHA,
 	})
-	return err
+}
+
+// confirmDirtyWorkBeforeRemoval rechecks the snapshot against the checkout
+// immediately before removal. A nil snapshot matches only a checkout that is
+// still clean.
+func confirmDirtyWorkBeforeRemoval(wtDir string, snap *git.DirtyWorkSnapshot) error {
+	ctx, cancel := context.WithTimeout(context.Background(), dirtyWorkCaptureTimeout)
+	defer cancel()
+	return git.DirtyWorkStillMatches(ctx, wtDir, snap)
 }
 
 // removeOrphanWorktree removes one run worktree directory its caller has
@@ -973,8 +981,13 @@ func captureDirtyWorkBeforeRemoval(gateDir, wtDir, runID, baseSHA string) error 
 // A capture failure returns false with the directory left in place.
 func removeOrphanWorktree(ctx context.Context, wt orphanWorktree) bool {
 	gateDir, wtPath := wt.gateDir, wt.dir
-	if err := captureDirtyWorkBeforeRemoval(gateDir, wtPath, wt.runID, wt.baseSHA); err != nil {
+	snap, err := captureDirtyWorkBeforeRemoval(gateDir, wtPath, wt.runID, wt.baseSHA)
+	if err != nil {
 		slog.Warn("preserving orphan worktree: unique uncommitted work was not captured", "path", wtPath, "run_id", wt.runID, "error", err)
+		return false
+	}
+	if err := confirmDirtyWorkBeforeRemoval(wtPath, snap); err != nil {
+		slog.Warn("preserving orphan worktree: checkout changed after the dirty work snapshot", "path", wtPath, "run_id", wt.runID, "error", err)
 		return false
 	}
 	if err := git.WorktreeRemove(ctx, gateDir, wtPath); err != nil {

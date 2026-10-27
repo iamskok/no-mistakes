@@ -83,6 +83,53 @@ func TestRemoveRunWorktreeKeepsDirtyWorkWhenCaptureFails(t *testing.T) {
 	}
 }
 
+func TestRemoveRunWorktreeRemovesSymlinkCheckout(t *testing.T) {
+	p := paths.WithRoot(t.TempDir())
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	d, err := db.Open(p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	_, headSHA := setupTestGitRepo(t, p, d, "repo1")
+	const runID = "01JZ8XQ7V6K9M3B0T5N2R4C8YE"
+	wtDir := filepath.Join(t.TempDir(), "link worktree")
+	gate := p.RepoDir("repo1")
+	gitCmd(t, gate, "worktree", "add", "--detach", wtDir, headSHA)
+	if err := os.MkdirAll(filepath.Join(wtDir, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("sub", filepath.Join(wtDir, "dirlink")); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	if err := os.Symlink("missing-target", filepath.Join(wtDir, "dangling")); err != nil {
+		t.Fatal(err)
+	}
+
+	NewRunManager(d, p, nil).removeRunWorktree("repo1", runID, gate, wtDir, "test")
+
+	if _, err := os.Stat(wtDir); !os.IsNotExist(err) {
+		t.Fatalf("symlink checkout was kept, stat err: %v", err)
+	}
+	commit := gitOutput(t, gate, "rev-parse", "--verify", git.DirtyWorkRef(runID)+"^{commit}")
+	restored := filepath.Join(t.TempDir(), "restored-links")
+	gitCmd(t, gate, "worktree", "add", "--detach", restored, headSHA)
+	if err := git.RestoreDirtyWork(context.Background(), restored, commit); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	for _, tc := range []struct{ name, want string }{
+		{"dirlink", "sub"},
+		{"dangling", "missing-target"},
+	} {
+		got, err := os.Readlink(filepath.Join(restored, tc.name))
+		if err != nil || got != tc.want {
+			t.Fatalf("restored %s = %q, %v; want %q", tc.name, got, err, tc.want)
+		}
+	}
+}
+
 func TestRemoveOrphanWorktreeKeepsDirtyWorkWhenCaptureFails(t *testing.T) {
 	p := paths.WithRoot(t.TempDir())
 	if err := p.EnsureDirs(); err != nil {

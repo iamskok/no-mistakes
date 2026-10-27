@@ -727,8 +727,9 @@ func (m *RunManager) cleanupRunEvidence(cfg *config.Config, runID string) {
 //
 // A checkout with unique uncommitted work is snapshotted into the gate before
 // removal. A failed or cancelled capture keeps the directory, including when
-// the snapshot is refused because a path is secret-bearing or outside the
-// checkout. A clean checkout is removed as before.
+// the snapshot is refused because a path is secret-bearing, not a regular
+// file, or outside the checkout, or because the checkout changed after the
+// snapshot was recorded. A clean checkout is removed as before.
 func (m *RunManager) removeRunWorktree(repoID, runID, gateDir, wtDir, reason string) {
 	m.sweepRunWorktreeProcesses(repoID, runID, wtDir)
 	run, err := m.db.GetRun(runID)
@@ -747,8 +748,13 @@ func (m *RunManager) removeRunWorktree(repoID, runID, gateDir, wtDir, reason str
 			runID = run.ID
 		}
 	}
-	if err := captureDirtyWorkBeforeRemoval(gateDir, wtDir, runID, baseSHA); err != nil {
+	snap, err := captureDirtyWorkBeforeRemoval(gateDir, wtDir, runID, baseSHA)
+	if err != nil {
 		slog.Warn("preserving run worktree: unique uncommitted work was not captured", "run_id", runID, "path", wtDir, "reason", reason, "error", err)
+		return
+	}
+	if err := confirmDirtyWorkBeforeRemoval(wtDir, snap); err != nil {
+		slog.Warn("preserving run worktree: checkout changed after the dirty work snapshot", "run_id", runID, "path", wtDir, "reason", reason, "error", err)
 		return
 	}
 	if err := git.WorktreeRemove(context.Background(), gateDir, wtDir); err != nil {

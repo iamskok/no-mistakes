@@ -63,6 +63,8 @@ func DirtyWorkRef(runID string) string {
 // checkout; any error, including cancellation, means the checkout must stay.
 // Secret-bearing paths and paths that resolve outside the checkout are
 // refused before any of their bytes are written into the object store.
+// Symlinks are stored as their link text. Sockets, fifos, and devices are
+// refused without being opened.
 func CaptureDirtyWork(ctx context.Context, req DirtyWorkRequest) (*DirtyWorkSnapshot, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -91,11 +93,7 @@ func CaptureDirtyWork(ctx context.Context, req DirtyWorkRequest) (*DirtyWorkSnap
 		return nil, err
 	}
 
-	status, err := RunRaw(ctx, wt, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames", "--ignore-submodules=none")
-	if err != nil {
-		return nil, err
-	}
-	entries, err := parsePorcelainZ(status)
+	entries, err := porcelainEntries(ctx, wt)
 	if err != nil {
 		return nil, err
 	}
@@ -106,7 +104,7 @@ func CaptureDirtyWork(ctx context.Context, req DirtyWorkRequest) (*DirtyWorkSnap
 	if _, err := Run(ctx, req.GateDir, "check-ref-format", ref); err != nil {
 		return nil, fmt.Errorf("snapshot ref %s: %w", ref, err)
 	}
-	paths, err := classifyDirtyPaths(ctx, wt, entries)
+	paths, err := loadDirtyEntries(ctx, wt, entries, true)
 	if err != nil {
 		return nil, err
 	}
@@ -119,6 +117,48 @@ func CaptureDirtyWork(ctx context.Context, req DirtyWorkRequest) (*DirtyWorkSnap
 		return nil, err
 	}
 	return snap, nil
+}
+
+// DirtyWorkStillMatches reports whether worktree still has exactly the
+// uncommitted work snap recorded. A nil snapshot matches only a clean
+// checkout, or a directory that is not a checkout. Callers invoke it
+// immediately before deleting the checkout; any error means it must stay.
+func DirtyWorkStillMatches(ctx context.Context, worktree string, snap *DirtyWorkSnapshot) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	info, err := os.Lstat(worktree)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%w: checkout is not a directory", ErrDirtyWorkRejected)
+	}
+	if _, err := os.Lstat(filepath.Join(worktree, ".git")); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("stat checkout git dir: %w", err)
+	}
+	if snap == nil {
+		return assertCheckoutClean(ctx, worktree)
+	}
+	head, indexTree, workTree, untrackedTree, err := readSnapshotTrees(ctx, worktree, snap.Commit)
+	if err != nil {
+		return err
+	}
+	if head != snap.Head {
+		return fmt.Errorf("dirty work snapshot head does not match the recorded checkout")
+	}
+	tmp, err := os.MkdirTemp("", "nm-dirty-work-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmp)
+	return recheckDirtyWork(ctx, worktree, tmp, head, indexTree, workTree, untrackedTree)
 }
 
 // RestoreDirtyWork reapplies a snapshot onto a checkout already at the
@@ -168,7 +208,23 @@ func parsePorcelainZ(out []byte) ([]dirtyEntry, error) {
 	return entries, nil
 }
 
-func classifyDirtyPaths(ctx context.Context, wt string, entries []dirtyEntry) ([]dirtyEntry, error) {
+func porcelainEntries(ctx context.Context, wt string) ([]dirtyEntry, error) {
+	status, err := RunRaw(ctx, wt, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames", "--ignore-submodules=none")
+	if err != nil {
+		return nil, err
+	}
+	return parsePorcelainZ(status)
+}
+
+func readDirtyEntries(ctx context.Context, wt string, screen bool) ([]dirtyEntry, error) {
+	entries, err := porcelainEntries(ctx, wt)
+	if err != nil || len(entries) == 0 {
+		return nil, err
+	}
+	return loadDirtyEntries(ctx, wt, entries, screen)
+}
+
+func loadDirtyEntries(ctx context.Context, wt string, entries []dirtyEntry, screen bool) ([]dirtyEntry, error) {
 	root := canonicalPath(wt)
 	for i := range entries {
 		rel, err := cleanCheckoutRel(entries[i].rel)
@@ -182,21 +238,37 @@ func classifyDirtyPaths(ctx context.Context, wt string, entries []dirtyEntry) ([
 		}
 		info, lerr := os.Lstat(full)
 		switch {
-		case lerr == nil && info.IsDir():
-			return nil, fmt.Errorf("%w: %s is a directory and cannot be snapshotted as a file", ErrDirtyWorkRejected, rel)
 		case lerr != nil && !errors.Is(lerr, os.ErrNotExist):
 			return nil, fmt.Errorf("stat %s: %w", rel, lerr)
+		case lerr == nil && !snapshotableFile(info):
+			return nil, notSnapshotable(rel, info)
 		}
-		secret, err := secretBearing(ctx, wt, entries[i], full)
-		if err != nil {
-			return nil, err
-		}
-		if secret {
-			return nil, fmt.Errorf("%w: %s is secret-bearing", ErrDirtyWorkRejected, rel)
+		if screen {
+			secret, err := secretBearing(ctx, wt, entries[i], full)
+			if err != nil {
+				return nil, err
+			}
+			if secret {
+				return nil, fmt.Errorf("%w: %s is secret-bearing", ErrDirtyWorkRejected, rel)
+			}
 		}
 		entries[i].kind = dirtyKind(entries[i].code)
 	}
 	return entries, nil
+}
+
+func snapshotableFile(info os.FileInfo) bool {
+	if info.Mode()&os.ModeSymlink != 0 {
+		return true
+	}
+	return info.Mode().IsRegular()
+}
+
+func notSnapshotable(rel string, info os.FileInfo) error {
+	if info.IsDir() {
+		return fmt.Errorf("%w: %s is a directory and cannot be snapshotted as a file", ErrDirtyWorkRejected, rel)
+	}
+	return fmt.Errorf("%w: %s is not a regular file", ErrDirtyWorkRejected, rel)
 }
 
 func dirtyKind(code string) string {
@@ -268,7 +340,10 @@ func assertPathOwned(root, full string) error {
 		return nil
 	}
 	target, err := filepath.EvalSymlinks(full)
-	if err != nil || !pathWithin(root, target) {
+	if err != nil {
+		return nil
+	}
+	if !pathWithin(root, target) {
 		return fmt.Errorf("%s escapes the checkout", filepath.Base(full))
 	}
 	return nil
@@ -289,15 +364,18 @@ func cleanCheckoutRel(rel string) (string, error) {
 }
 
 func secretBearing(ctx context.Context, wt string, entry dirtyEntry, full string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	if secretPath(entry.rel) && entryHasBytes(ctx, wt, entry, full) {
 		return true, nil
 	}
-	if entry.code != "??" && entry.code[0] != ' ' && entry.code[0] != 'D' && entry.code[0] != '?' {
-		prefix, err := indexBlobPrefix(ctx, wt, entry.rel)
+	if indexDiffers(entry.code) {
+		secret, err := indexBlobContainsSecret(ctx, wt, entry.rel)
 		if err != nil {
 			return false, err
 		}
-		if bytesContainSecret(prefix) {
+		if secret {
 			return true, nil
 		}
 	}
@@ -308,20 +386,21 @@ func secretBearing(ctx context.Context, wt string, entry dirtyEntry, full string
 		}
 		return false, err
 	}
-	if info.IsDir() {
-		return false, nil
+	if info.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Readlink(full)
+		if err != nil {
+			return false, err
+		}
+		return bytesContainSecret([]byte(target)), nil
 	}
-	f, err := os.Open(full)
-	if err != nil {
-		return false, err
+	if !info.Mode().IsRegular() {
+		return false, notSnapshotable(entry.rel, info)
 	}
-	defer f.Close()
-	buf := make([]byte, secretScanBytes)
-	n, err := io.ReadFull(f, buf)
-	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
-		return false, err
-	}
-	return bytesContainSecret(buf[:n]), nil
+	return regularFileContainsSecret(ctx, full)
+}
+
+func indexDiffers(code string) bool {
+	return code != "??" && code[0] != ' ' && code[0] != 'D' && code[0] != '?'
 }
 
 func entryHasBytes(ctx context.Context, wt string, entry dirtyEntry, full string) bool {
@@ -334,8 +413,6 @@ func entryHasBytes(ctx context.Context, wt string, entry dirtyEntry, full string
 	_, err := Run(ctx, wt, "cat-file", "-e", ":"+entry.rel)
 	return err == nil
 }
-
-const secretScanBytes = 256 * 1024
 
 func secretPath(rel string) bool {
 	slashed := filepath.ToSlash(rel)
@@ -362,16 +439,29 @@ func secretPath(rel string) bool {
 	return false
 }
 
-func bytesContainSecret(buf []byte) bool {
-	markers := [][]byte{
-		[]byte("-----BEGIN PRIVATE KEY-----"),
-		[]byte("-----BEGIN RSA PRIVATE KEY-----"),
-		[]byte("-----BEGIN OPENSSH PRIVATE KEY-----"),
-		[]byte("-----BEGIN EC PRIVATE KEY-----"),
-		[]byte("-----BEGIN DSA PRIVATE KEY-----"),
-		[]byte("-----BEGIN PGP PRIVATE KEY BLOCK-----"),
+var privateKeyMarkers = [][]byte{
+	[]byte("-----BEGIN PRIVATE KEY-----"),
+	[]byte("-----BEGIN RSA PRIVATE KEY-----"),
+	[]byte("-----BEGIN OPENSSH PRIVATE KEY-----"),
+	[]byte("-----BEGIN EC PRIVATE KEY-----"),
+	[]byte("-----BEGIN DSA PRIVATE KEY-----"),
+	[]byte("-----BEGIN PGP PRIVATE KEY BLOCK-----"),
+}
+
+const secretReadChunk = 32 * 1024
+
+func secretMarkerOverlap() int {
+	n := 0
+	for _, marker := range privateKeyMarkers {
+		if len(marker)-1 > n {
+			n = len(marker) - 1
+		}
 	}
-	for _, marker := range markers {
+	return n
+}
+
+func bytesContainSecret(buf []byte) bool {
+	for _, marker := range privateKeyMarkers {
 		if bytes.Contains(buf, marker) {
 			return true
 		}
@@ -379,18 +469,61 @@ func bytesContainSecret(buf []byte) bool {
 	return false
 }
 
-func indexBlobPrefix(ctx context.Context, dir, rel string) ([]byte, error) {
-	if _, err := Run(ctx, dir, "cat-file", "-e", ":"+rel); err != nil {
-		return nil, fmt.Errorf("index blob %s: %w", rel, err)
+func regularFileContainsSecret(ctx context.Context, full string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
 	}
-	buf, err := readGitPrefix(ctx, dir, secretScanBytes, "cat-file", "blob", ":"+rel)
+	f, err := os.Open(full)
 	if err != nil {
-		return nil, fmt.Errorf("read index %s: %w", rel, err)
+		return false, err
 	}
-	return buf, nil
+	defer f.Close()
+	return readerContainsSecret(ctx, f)
 }
 
-func readGitPrefix(ctx context.Context, dir string, n int, args ...string) ([]byte, error) {
+func readerContainsSecret(ctx context.Context, r io.Reader) (bool, error) {
+	overlap := secretMarkerOverlap()
+	buf := make([]byte, secretReadChunk)
+	var tail []byte
+	for {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		n, err := r.Read(buf)
+		if n > 0 {
+			window := make([]byte, 0, len(tail)+n)
+			window = append(window, tail...)
+			window = append(window, buf[:n]...)
+			if bytesContainSecret(window) {
+				return true, nil
+			}
+			if len(window) > overlap {
+				tail = append([]byte(nil), window[len(window)-overlap:]...)
+			} else {
+				tail = append([]byte(nil), window...)
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+	}
+}
+
+func indexBlobContainsSecret(ctx context.Context, dir, rel string) (bool, error) {
+	if _, err := Run(ctx, dir, "cat-file", "-e", ":"+rel); err != nil {
+		return false, fmt.Errorf("index blob %s: %w", rel, err)
+	}
+	found, err := gitStreamContainsSecret(ctx, dir, "cat-file", "blob", ":"+rel)
+	if err != nil {
+		return false, fmt.Errorf("read index %s: %w", rel, err)
+	}
+	return found, nil
+}
+
+func gitStreamContainsSecret(ctx context.Context, dir string, args ...string) (bool, error) {
 	if isBareGitDir(dir) {
 		args = append([]string{"--git-dir=" + dir}, args...)
 	}
@@ -401,32 +534,36 @@ func readGitPrefix(ctx context.Context, dir string, n int, args ...string) ([]by
 	shellenv.ConfigureShellCommand(cmd)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, err
+		return false, err
 	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
-		return nil, err
+		return false, err
 	}
-	buf := make([]byte, n)
-	read, readErr := io.ReadFull(stdout, buf)
-	if cmd.Process != nil {
-		_ = cmd.Process.Kill()
+	found, readErr := readerContainsSecret(ctx, stdout)
+	if found || readErr != nil {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
 	}
 	waitErr := cmd.Wait()
-	if readErr != nil && !errors.Is(readErr, io.ErrUnexpectedEOF) && !errors.Is(readErr, io.EOF) {
+	if readErr != nil {
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return false, ctx.Err()
 		}
-		return nil, fmt.Errorf("git %s: %v: %s", strings.Join(args, " "), waitErr, strings.TrimSpace(stderr.String()))
+		return false, readErr
 	}
-	if read == 0 && waitErr != nil {
+	if found {
+		return true, nil
+	}
+	if waitErr != nil {
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return false, ctx.Err()
 		}
-		return nil, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), waitErr, strings.TrimSpace(stderr.String()))
+		return false, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), waitErr, strings.TrimSpace(stderr.String()))
 	}
-	return buf[:read], nil
+	return false, nil
 }
 
 func writeDirtySnapshot(ctx context.Context, req DirtyWorkRequest, ref string, paths []dirtyEntry) (*DirtyWorkSnapshot, error) {
@@ -462,23 +599,9 @@ func writeDirtySnapshot(ctx context.Context, req DirtyWorkRequest, ref string, p
 		return nil, fmt.Errorf("index changed while capturing dirty work")
 	}
 
-	workCopy := filepath.Join(tmp, "worktree-index")
-	if err := copyFile(workCopy, indexPath); err != nil {
-		return nil, err
-	}
-	workEnv := []string{"GIT_INDEX_FILE=" + workCopy}
-	if _, err := RunWithEnv(ctx, wt, workEnv, "add", "-u"); err != nil {
-		return nil, fmt.Errorf("snapshot tracked worktree: %w", err)
-	}
-	if _, err := RunWithEnv(ctx, wt, workEnv, "diff-files", "--quiet"); err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		return nil, fmt.Errorf("tracked worktree snapshot does not match the checkout: %w", err)
-	}
-	workTree, err := RunWithEnv(ctx, wt, workEnv, "write-tree")
+	workTree, err := buildWorkTree(ctx, wt, filepath.Join(tmp, "worktree-index"))
 	if err != nil {
-		return nil, fmt.Errorf("write worktree tree: %w", err)
+		return nil, err
 	}
 	liveAgain, err := Run(ctx, wt, "write-tree")
 	if err != nil {
@@ -533,6 +656,9 @@ func writeDirtySnapshot(ctx context.Context, req DirtyWorkRequest, ref string, p
 	}
 	if _, err := Run(ctx, req.GateDir, "cat-file", "-t", commit); err != nil {
 		return nil, fmt.Errorf("snapshot is not in the gate repository: %w", err)
+	}
+	if err := recheckDirtyWork(ctx, wt, tmp, head, indexTree, workTree, untrackedTree); err != nil {
+		return nil, err
 	}
 	if _, err := Run(ctx, req.GateDir, "update-ref", ref, commit); err != nil {
 		return nil, fmt.Errorf("record dirty work snapshot: %w", err)
@@ -605,16 +731,29 @@ func hashUntracked(ctx context.Context, wt, full string) (mode, blob string, err
 	if err != nil {
 		return "", "", err
 	}
+	if !snapshotableFile(info) {
+		return "", "", notSnapshotable(filepath.Base(full), info)
+	}
 	if info.Mode()&os.ModeSymlink != 0 {
 		target, err := os.Readlink(full)
 		if err != nil {
 			return "", "", err
+		}
+		if bytesContainSecret([]byte(target)) {
+			return "", "", fmt.Errorf("%w: %s is secret-bearing", ErrDirtyWorkRejected, filepath.Base(full))
 		}
 		blob, err = runInDirWithEnvAndInput(ctx, wt, nil, target, "hash-object", "-w", "--stdin")
 		if err != nil {
 			return "", "", err
 		}
 		return "120000", blob, nil
+	}
+	secret, err := regularFileContainsSecret(ctx, full)
+	if err != nil {
+		return "", "", err
+	}
+	if secret {
+		return "", "", fmt.Errorf("%w: %s is secret-bearing", ErrDirtyWorkRejected, filepath.Base(full))
 	}
 	mode = "100644"
 	if info.Mode()&0o111 != 0 {
@@ -632,6 +771,9 @@ func hashFileBlob(ctx context.Context, wt, full string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if !snapshotableFile(info) {
+		return "", notSnapshotable(filepath.Base(full), info)
+	}
 	if info.Mode()&os.ModeSymlink != 0 {
 		target, err := os.Readlink(full)
 		if err != nil {
@@ -640,6 +782,133 @@ func hashFileBlob(ctx context.Context, wt, full string) (string, error) {
 		return runInDirWithEnvAndInput(ctx, wt, nil, target, "hash-object", "--stdin")
 	}
 	return Run(ctx, wt, "hash-object", "--", full)
+}
+
+func buildWorkTree(ctx context.Context, wt, indexFile string) (string, error) {
+	if _, err := readDirtyEntries(ctx, wt, true); err != nil {
+		return "", err
+	}
+	indexPath, err := absoluteGitPath(ctx, wt, "index")
+	if err != nil {
+		return "", err
+	}
+	if err := copyFile(indexFile, indexPath); err != nil {
+		return "", err
+	}
+	env := []string{"GIT_INDEX_FILE=" + indexFile}
+	if _, err := RunWithEnv(ctx, wt, env, "add", "-u"); err != nil {
+		return "", fmt.Errorf("snapshot tracked worktree: %w", err)
+	}
+	if _, err := RunWithEnv(ctx, wt, env, "diff-files", "--quiet"); err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		return "", fmt.Errorf("tracked worktree snapshot does not match the checkout: %w", err)
+	}
+	tree, err := RunWithEnv(ctx, wt, env, "write-tree")
+	if err != nil {
+		return "", fmt.Errorf("write worktree tree: %w", err)
+	}
+	return tree, nil
+}
+
+func recheckDirtyWork(ctx context.Context, wt, tmp, head, indexTree, workTree, untrackedTree string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	current, err := Run(ctx, wt, "rev-parse", "--verify", "HEAD")
+	if err != nil {
+		return fmt.Errorf("read checkout head: %w", err)
+	}
+	if current != head {
+		return fmt.Errorf("checkout HEAD changed while capturing dirty work")
+	}
+	live, err := Run(ctx, wt, "write-tree")
+	if err != nil {
+		return fmt.Errorf("read live index: %w", err)
+	}
+	if live != indexTree {
+		return fmt.Errorf("index changed while capturing dirty work")
+	}
+	gotWork, err := buildWorkTree(ctx, wt, filepath.Join(tmp, "recheck-worktree-index"))
+	if err != nil {
+		return err
+	}
+	if gotWork != workTree {
+		return fmt.Errorf("tracked worktree changed while capturing dirty work")
+	}
+	liveAgain, err := Run(ctx, wt, "write-tree")
+	if err != nil {
+		return err
+	}
+	if liveAgain != indexTree {
+		return fmt.Errorf("capture changed the checkout index")
+	}
+	entries, err := readDirtyEntries(ctx, wt, true)
+	if err != nil {
+		return err
+	}
+	var untracked []dirtyEntry
+	for _, entry := range entries {
+		if entry.code == "??" {
+			untracked = append(untracked, entry)
+		}
+	}
+	if untrackedTree == "" {
+		if len(untracked) != 0 {
+			return fmt.Errorf("untracked files appeared while capturing dirty work")
+		}
+		return nil
+	}
+	if len(untracked) == 0 {
+		return fmt.Errorf("untracked files disappeared while capturing dirty work")
+	}
+	got, err := writeUntrackedTree(ctx, wt, tmp, untracked)
+	if err != nil {
+		return err
+	}
+	if got != untrackedTree {
+		return fmt.Errorf("untracked files changed while capturing dirty work")
+	}
+	return nil
+}
+
+func assertCheckoutClean(ctx context.Context, wt string) error {
+	entries, err := readDirtyEntries(ctx, wt, false)
+	if err != nil {
+		return err
+	}
+	if len(entries) != 0 {
+		return fmt.Errorf("checkout changed after the dirty work snapshot")
+	}
+	return nil
+}
+
+func readSnapshotTrees(ctx context.Context, wt, commit string) (head, indexTree, workTree, untrackedTree string, err error) {
+	line, err := Run(ctx, wt, "rev-list", "--parents", "-n", "1", commit)
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("read snapshot parents: %w", err)
+	}
+	fields := strings.Fields(line)
+	if len(fields) < 3 || len(fields) > 4 {
+		return "", "", "", "", fmt.Errorf("dirty work snapshot %s has %d parents", commit, len(fields)-1)
+	}
+	head = fields[1]
+	indexTree, err = Run(ctx, wt, "rev-parse", "--verify", fields[2]+"^{tree}")
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("read snapshot index: %w", err)
+	}
+	workTree, err = Run(ctx, wt, "rev-parse", "--verify", commit+"^{tree}")
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("read snapshot worktree: %w", err)
+	}
+	if len(fields) == 4 {
+		untrackedTree, err = Run(ctx, wt, "rev-parse", "--verify", fields[3]+"^{tree}")
+		if err != nil {
+			return "", "", "", "", fmt.Errorf("read snapshot untracked tree: %w", err)
+		}
+	}
+	return head, indexTree, workTree, untrackedTree, nil
 }
 
 func verifyDirtySnapshot(ctx context.Context, wt, commit, head, indexCommit, untrackedCommit, indexTree, workTree, message string) error {

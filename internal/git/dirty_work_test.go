@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -208,6 +209,156 @@ func TestCaptureDirtyWork_RejectsSecretBearingWork(t *testing.T) {
 	assertObjectStoreLacks(t, gate, marker)
 	if _, err := Run(ctx, gate, "rev-parse", "--verify", "--quiet", DirtyWorkRef(dirtyWorkRunID)); err == nil {
 		t.Fatal("rejected capture published a snapshot ref")
+	}
+}
+
+func TestCaptureDirtyWork_SnapshotsSymlinkText(t *testing.T) {
+	ctx := context.Background()
+	gate, wt, head, _ := newDirtyWorkGate(t, "links")
+	dirLink := filepath.Join(wt, "dirlink")
+	if err := os.Symlink("sub dir", dirLink); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	if err := os.Symlink("missing-target", filepath.Join(wt, "dangling")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("..", "outside-missing"), filepath.Join(wt, "dangling-out")); err != nil {
+		t.Fatal(err)
+	}
+
+	snap, err := CaptureDirtyWork(ctx, DirtyWorkRequest{GateDir: gate, Worktree: wt, RunID: dirtyWorkRunID})
+	if err != nil {
+		t.Fatalf("capture: %v", err)
+	}
+	if err := DirtyWorkStillMatches(ctx, wt, snap); err != nil {
+		t.Fatalf("fresh symlink snapshot: %v", err)
+	}
+	if err := WorktreeRemove(ctx, gate, wt); err != nil {
+		t.Fatalf("remove worktree: %v", err)
+	}
+	restored := filepath.Join(t.TempDir(), "restored-links")
+	if err := WorktreeAdd(ctx, gate, restored, head); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = WorktreeRemove(ctx, gate, restored) })
+	if err := RestoreDirtyWork(ctx, restored, snap.Commit); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	for _, tc := range []struct{ name, want string }{
+		{"dirlink", "sub dir"},
+		{"dangling", "missing-target"},
+		{"dangling-out", filepath.Join("..", "outside-missing")},
+	} {
+		got, err := os.Readlink(filepath.Join(restored, tc.name))
+		if err != nil {
+			t.Fatalf("readlink %s: %v", tc.name, err)
+		}
+		if got != tc.want {
+			t.Fatalf("restored %s = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestCaptureDirtyWork_RejectsSecretPastPrefix(t *testing.T) {
+	ctx := context.Background()
+	gate, wt, _, _ := newDirtyWorkGate(t, "long-secret")
+	const marker = "nm-late-secret-marker-8f3a"
+	body := append(bytes.Repeat([]byte("a"), 256*1024), []byte("-----BEGIN RSA PRIVATE KEY-----\n"+marker+"\n")...)
+	if err := os.WriteFile(filepath.Join(wt, "late.txt"), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := CaptureDirtyWork(ctx, DirtyWorkRequest{GateDir: gate, Worktree: wt, RunID: dirtyWorkRunID})
+	if !errors.Is(err, ErrDirtyWorkRejected) {
+		t.Fatalf("late secret error = %v", err)
+	}
+	assertObjectStoreLacks(t, gate, marker)
+	if _, err := Run(ctx, gate, "rev-parse", "--verify", "--quiet", DirtyWorkRef(dirtyWorkRunID)); err == nil {
+		t.Fatal("late secret published a snapshot ref")
+	}
+
+	if err := os.Remove(filepath.Join(wt, "late.txt")); err != nil {
+		t.Fatal(err)
+	}
+	staged := append(bytes.Repeat([]byte("b"), 256*1024), []byte("-----BEGIN OPENSSH PRIVATE KEY-----\n"+marker+"-index\n")...)
+	stagedPath := filepath.Join(wt, "staged-late.txt")
+	if err := os.WriteFile(stagedPath, staged, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, wt, "git", "add", "--", "staged-late.txt")
+	if err := os.WriteFile(stagedPath, []byte("plain worktree\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err = CaptureDirtyWork(ctx, DirtyWorkRequest{GateDir: gate, Worktree: wt, RunID: dirtyWorkRunID})
+	if !errors.Is(err, ErrDirtyWorkRejected) {
+		t.Fatalf("staged late secret error = %v", err)
+	}
+	if _, err := Run(ctx, gate, "rev-parse", "--verify", "--quiet", DirtyWorkRef(dirtyWorkRunID)); err == nil {
+		t.Fatal("staged late secret published a snapshot ref")
+	}
+}
+
+func TestReaderContainsSecretFindsMarkerAcrossReads(t *testing.T) {
+	marker := []byte("-----BEGIN OPENSSH PRIVATE KEY-----")
+	body := append(bytes.Repeat([]byte("a"), 3), marker...)
+	body = append(body, []byte("tail")...)
+	found, err := readerContainsSecret(context.Background(), &oneByteReader{rest: body})
+	if err != nil || !found {
+		t.Fatalf("found = %v, err = %v", found, err)
+	}
+	found, err = readerContainsSecret(context.Background(), &oneByteReader{rest: bytes.Repeat([]byte("a"), len(marker)+5)})
+	if err != nil || found {
+		t.Fatalf("clean found = %v, err = %v", found, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = readerContainsSecret(ctx, &oneByteReader{rest: bytes.Repeat([]byte("a"), 8)})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled reader error = %v", err)
+	}
+}
+
+type oneByteReader struct{ rest []byte }
+
+func (r *oneByteReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if len(r.rest) == 0 {
+		return 0, io.EOF
+	}
+	p[0] = r.rest[0]
+	r.rest = r.rest[1:]
+	return 1, nil
+}
+
+func TestDirtyWorkStillMatchesRefusesDriftBeforeRemoval(t *testing.T) {
+	ctx := context.Background()
+	gate, wt, _, _ := newDirtyWorkGate(t, "drift")
+	if err := DirtyWorkStillMatches(ctx, wt, nil); err != nil {
+		t.Fatalf("clean checkout: %v", err)
+	}
+	writeFile(t, filepath.Join(wt, "file.txt"), "edited\n")
+	snap, err := CaptureDirtyWork(ctx, DirtyWorkRequest{GateDir: gate, Worktree: wt, RunID: dirtyWorkRunID})
+	if err != nil {
+		t.Fatalf("capture: %v", err)
+	}
+	if err := DirtyWorkStillMatches(ctx, wt, snap); err != nil {
+		t.Fatalf("unchanged snapshot: %v", err)
+	}
+	writeFile(t, filepath.Join(wt, "file.txt"), "edited again\n")
+	if err := DirtyWorkStillMatches(ctx, wt, snap); err == nil {
+		t.Fatal("tracked edit after the snapshot still matched")
+	}
+	if got := mustRead(t, filepath.Join(wt, "file.txt")); string(got) != "edited again\n" {
+		t.Fatalf("drift check rewrote file.txt: %q", got)
+	}
+	writeFile(t, filepath.Join(wt, "file.txt"), "edited\n")
+	writeFile(t, filepath.Join(wt, "extra.txt"), "appeared later\n")
+	if err := DirtyWorkStillMatches(ctx, wt, snap); err == nil {
+		t.Fatal("untracked file created after the snapshot still matched")
+	}
+	if err := DirtyWorkStillMatches(ctx, wt, nil); err == nil {
+		t.Fatal("nil snapshot matched a dirty checkout")
 	}
 }
 
