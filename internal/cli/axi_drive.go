@@ -1558,8 +1558,11 @@ func newAxiRespondCmd() *cobra.Command {
 			"recorded as declined, the step fails as \"aborted by user: <reason>\", and the\n" +
 			"run ends failed. --reason is required and is kept in the step error and the\n" +
 			"run error. No fix round starts and nothing is approved or pushed. Saved\n" +
-			"commits, findings and evidence stay available, but the failed run removes its\n" +
-			"worktree, so save any uncommitted edits first. Return branch custody through\n" +
+			"commits, findings and evidence stay available. Unique uncommitted work is\n" +
+			"snapshotted in the gate at refs/no-mistakes/dirty/<run-id> before the worktree\n" +
+			"is removed, and the worktree is kept if that snapshot cannot be verified.\n" +
+			"Restore it by checking out the snapshot's first parent and running\n" +
+			"git stash apply --index <snapshot>. Return branch custody through\n" +
 			"the structured branch_sync next_action in the output. Unlike `axi abort`,\n" +
 			"which cancels whatever the run is doing, this records a rejection at one\n" +
 			"gate and is refused unless the run is parked there.\n\n" +

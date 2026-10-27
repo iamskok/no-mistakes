@@ -852,6 +852,7 @@ type orphanWorktree struct {
 	dir     string
 	repoID  string
 	runID   string
+	baseSHA string
 }
 
 // defaultTreeOrphanWorktrees walks <NM_HOME>/worktrees, which no-mistakes owns
@@ -882,7 +883,7 @@ func defaultTreeOrphanWorktrees(d *db.DB, p *paths.Paths) (removable []orphanWor
 				repoID:  repoEntry.Name(),
 				runID:   runEntry.Name(),
 			}
-			if removableOrphanWorktree(d, wt) {
+			if removableOrphanWorktree(d, &wt) {
 				removable = append(removable, wt)
 			}
 		}
@@ -910,7 +911,7 @@ func recordedOrphanWorktrees(d *db.DB, p *paths.Paths, leftover []db.RunWorktree
 			continue
 		}
 		candidate := orphanWorktree{gateDir: p.RepoDir(wt.RepoID), dir: wt.Dir, repoID: wt.RepoID, runID: wt.RunID}
-		if removableOrphanWorktree(d, candidate) {
+		if removableOrphanWorktree(d, &candidate) {
 			removable = append(removable, candidate)
 		}
 	}
@@ -921,7 +922,7 @@ func recordedOrphanWorktrees(d *db.DB, p *paths.Paths, leftover []db.RunWorktree
 // This removal decision does not exempt retained terminal runs from evidence
 // expiry (a separate, unrelated budget); the startup process sweep now applies
 // the same worktree retention policy through retainedDefaultTreeRunIDs.
-func removableOrphanWorktree(d *db.DB, wt orphanWorktree) bool {
+func removableOrphanWorktree(d *db.DB, wt *orphanWorktree) bool {
 	if skip, reason := skipWorktreeCleanup(context.Background(), d, wt.runID, wt.dir); skip {
 		slog.Info("skipping worktree cleanup", "path", wt.dir, "reason", reason)
 		return false
@@ -931,6 +932,9 @@ func removableOrphanWorktree(d *db.DB, wt orphanWorktree) bool {
 		slog.Warn("preserving run worktree: cannot read run", "run_id", wt.runID, "error", err)
 		return false
 	}
+	if run != nil {
+		wt.baseSHA = run.BaseSHA
+	}
 	if reason := protectedPathCleanupReason(d, run); reason != "" {
 		slog.Info("skipping worktree cleanup", "path", wt.dir, "reason", reason)
 		return false
@@ -938,12 +942,41 @@ func removableOrphanWorktree(d *db.DB, wt orphanWorktree) bool {
 	return true
 }
 
+// dirtyWorkCaptureTimeout bounds the snapshot taken before a checkout is
+// removed. The run context is already cancelled for a failed or cancelled
+// run, so this timeout is independent of it: a dead run context must not
+// skip the snapshot, and a snapshot that does not finish is a capture
+// failure that keeps the checkout.
+const dirtyWorkCaptureTimeout = 5 * time.Minute
+
+// captureDirtyWorkBeforeRemoval records unique uncommitted work in the gate
+// before a checkout is deleted. A nil error means the checkout was clean or
+// the snapshot was verified. Any error means the caller must not delete it.
+func captureDirtyWorkBeforeRemoval(gateDir, wtDir, runID, baseSHA string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), dirtyWorkCaptureTimeout)
+	defer cancel()
+	_, err := git.CaptureDirtyWork(ctx, git.DirtyWorkRequest{
+		GateDir:  gateDir,
+		Worktree: wtDir,
+		RunID:    runID,
+		BaseSHA:  baseSHA,
+	})
+	return err
+}
+
 // removeOrphanWorktree removes one run worktree directory its caller has
 // already decided on and swept (see cleanupOrphanWorktrees). It reports
 // whether the directory was actually removed, since git worktree remove and
 // its os.RemoveAll fallback can both fail and merely log a warning.
+//
+// os.RemoveAll runs only after unique uncommitted work has been snapshotted.
+// A capture failure returns false with the directory left in place.
 func removeOrphanWorktree(ctx context.Context, wt orphanWorktree) bool {
 	gateDir, wtPath := wt.gateDir, wt.dir
+	if err := captureDirtyWorkBeforeRemoval(gateDir, wtPath, wt.runID, wt.baseSHA); err != nil {
+		slog.Warn("preserving orphan worktree: unique uncommitted work was not captured", "path", wtPath, "run_id", wt.runID, "error", err)
+		return false
+	}
 	if err := git.WorktreeRemove(ctx, gateDir, wtPath); err != nil {
 		slog.Warn("git worktree remove failed, falling back to os.RemoveAll", "path", wtPath, "error", err)
 		if err := os.RemoveAll(wtPath); err != nil {
