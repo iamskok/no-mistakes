@@ -47,7 +47,7 @@ type DirtyWorkRequest struct {
 // checkout. Its first parent is the checkout HEAD, its second parent records
 // the index, and a third parent records owned untracked files when any exist.
 // Restore it with RestoreDirtyWork, or by checking out the first parent and
-// running `git stash apply --index <commit>`.
+// running `git -c core.symlinks=true stash apply --index <commit>`.
 type DirtyWorkSnapshot struct {
 	Ref    string
 	Commit string
