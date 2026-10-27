@@ -213,7 +213,7 @@ Six global config fields tune resolution and invocation, and the [Global Config 
 
 ## Review session reuse
 
-With the default `session_reuse: true`, Claude, Codex, Grok, Pi, and Antigravity keep one durable review-fixer session per run when every configured fixer for that run supports resume. A later-round fixer that cannot resume makes all fixer turns cold. Resume failures still fall back to a fresh fixer session instead of skipping the fix turn. Pi stores its native fixer transcript in Pi's session directory; no-mistakes persists only the minimum session identity needed to resume it.
+With the default `session_reuse: true`, Claude, Codex, Grok, Pi, and Antigravity keep one durable review-fixer session per run when every configured fixer for that run supports resume. A later-round fixer that cannot resume makes all fixer turns cold. Resume failures still fall back to a fresh fixer session instead of skipping the fix turn. A completed turn whose terminal text fails the result schema does not take that fallback. Pi stores its native fixer transcript in Pi's session directory; no-mistakes persists only the minimum session identity needed to resume it.
 Review turns always run in fresh, session-free invocations: a rereview certifies fixes that implement the previous review turn's findings, so it must never resume the session that prescribed them.
 The [`session_reuse` field reference](/no-mistakes/reference/global-config/#session_reuse) owns the exact reuse, fallback, privacy, and restart-recovery semantics.
 
