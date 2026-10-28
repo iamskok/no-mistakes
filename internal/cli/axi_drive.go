@@ -1558,10 +1558,11 @@ func newAxiRespondCmd() *cobra.Command {
 			"recorded as declined, the step fails as \"aborted by user: <reason>\", and the\n" +
 			"run ends failed. --reason is required and is kept in the step error and the\n" +
 			"run error. No fix round starts and nothing is approved or pushed. Saved\n" +
-			"commits, findings and evidence stay available. Unique uncommitted work is\n" +
-			"snapshotted in the gate at refs/no-mistakes/dirty/<run-id> before the worktree\n" +
-			"is removed, and the worktree is kept if that snapshot cannot be verified.\n" +
-			"Ignored files are not part of that snapshot and are removed with the worktree.\n" +
+			"commits, findings and evidence stay available. Cleanup currently retains every\n" +
+			"real checkout, even when clean or successfully snapshotted, because stability\n" +
+			"through removal cannot be proven. Cleanup attempts to snapshot unique\n" +
+			"uncommitted work in the gate at refs/no-mistakes/dirty/<run-id>. Ignored files\n" +
+			"are excluded from the snapshot.\n" +
 			"Read restore-core-autocrlf and restore-core-eol from the snapshot message.\n" +
 			"Use those values for both creating a worktree at the first parent and running\n" +
 			"git -c core.symlinks=true -c core.autocrlf=<saved> -c core.eol=<saved> -c apply.whitespace=nowarn stash apply --index <snapshot>.\n" +
