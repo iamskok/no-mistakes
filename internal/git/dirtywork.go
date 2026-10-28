@@ -223,11 +223,14 @@ func porcelainEntries(ctx context.Context, wt string) ([]dirtyEntry, error) {
 // porcelain, and both the clean short-circuit and the pre-removal check
 // read this list.
 func checkoutDirtyEntries(ctx context.Context, wt string) ([]dirtyEntry, error) {
+	if err := rejectIndexIntent(ctx, wt, nil); err != nil {
+		return nil, err
+	}
 	entries, err := porcelainEntries(ctx, wt)
 	if err != nil {
 		return nil, err
 	}
-	return appendHiddenTrackedEdits(ctx, wt, entries)
+	return appendTrackedByteEdits(ctx, wt, entries)
 }
 
 func gitStatusArgs() []string {
@@ -245,18 +248,8 @@ func withSymlinks(args ...string) []string {
 	return out
 }
 
-// statusHidesWorktree reports tags from git ls-files -v whose worktree
-// changes do not appear in git status. Skip-worktree is S; assume-unchanged
-// is any lowercase tag, including s when both bits are set.
-func statusHidesWorktree(tag byte) bool {
-	if tag == 'S' {
-		return true
-	}
-	return tag >= 'a' && tag <= 'z'
-}
-
-func appendHiddenTrackedEdits(ctx context.Context, wt string, entries []dirtyEntry) ([]dirtyEntry, error) {
-	out, err := RunRaw(ctx, wt, "ls-files", "-v", "-z")
+func appendTrackedByteEdits(ctx context.Context, wt string, entries []dirtyEntry) ([]dirtyEntry, error) {
+	out, err := RunRaw(ctx, wt, "ls-files", "--stage", "-z")
 	if err != nil {
 		return nil, err
 	}
@@ -264,22 +257,18 @@ func appendHiddenTrackedEdits(ctx context.Context, wt string, entries []dirtyEnt
 	for i := range entries {
 		seen[filepath.ToSlash(entries[i].rel)] = i
 	}
-	for _, raw := range bytes.Split(out, []byte{0}) {
-		if len(raw) < 3 || raw[1] != ' ' || !statusHidesWorktree(raw[0]) {
-			continue
-		}
-		rel := string(raw[2:])
-		differs, exists, err := trackedPathDiffers(ctx, wt, rel)
+	err = walkIndexBlobs(out, func(mode, rel, sha string) error {
+		differs, exists, err := trackedPathDiffers(ctx, wt, rel, mode, sha)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if !differs {
-			continue
+			return nil
 		}
 		slash := filepath.ToSlash(rel)
 		if i, ok := seen[slash]; ok {
 			entries[i].code = overlayHiddenWorktree(entries[i].code, exists)
-			continue
+			return nil
 		}
 		code := " M"
 		if !exists {
@@ -287,8 +276,9 @@ func appendHiddenTrackedEdits(ctx context.Context, wt string, entries []dirtyEnt
 		}
 		entries = append(entries, dirtyEntry{code: code, rel: rel})
 		seen[slash] = len(entries) - 1
-	}
-	return entries, nil
+		return nil
+	})
+	return entries, err
 }
 
 func overlayHiddenWorktree(code string, exists bool) string {
@@ -302,8 +292,11 @@ func overlayHiddenWorktree(code string, exists bool) string {
 	return string([]byte{code[0], col})
 }
 
-func trackedPathDiffers(ctx context.Context, wt, rel string) (differs, exists bool, err error) {
+func trackedPathDiffers(ctx context.Context, wt, rel, mode, sha string) (differs, exists bool, err error) {
 	full := filepath.Join(wt, filepath.FromSlash(rel))
+	if err := assertPathOwned(canonicalPath(wt), full); err != nil {
+		return false, false, fmt.Errorf("%w: %s", ErrDirtyWorkRejected, err)
+	}
 	info, lerr := os.Lstat(full)
 	if lerr != nil {
 		if errors.Is(lerr, os.ErrNotExist) {
@@ -311,14 +304,7 @@ func trackedPathDiffers(ctx context.Context, wt, rel string) (differs, exists bo
 		}
 		return false, false, lerr
 	}
-	mode, sha, single, err := indexBlob(ctx, wt, rel)
-	if err != nil {
-		return false, true, err
-	}
-	if !single {
-		return true, true, nil
-	}
-	workMode, workSHA, err := worktreeBlob(ctx, wt, rel, full, info)
+	workMode, workSHA, err := worktreeBlob(ctx, wt, full, info)
 	if err != nil {
 		if errors.Is(err, errNotRegular) {
 			return true, true, nil
@@ -328,38 +314,7 @@ func trackedPathDiffers(ctx context.Context, wt, rel string) (differs, exists bo
 	return mode != workMode || sha != workSHA, true, nil
 }
 
-func indexBlob(ctx context.Context, wt, rel string) (mode, sha string, single bool, err error) {
-	out, err := RunRaw(ctx, wt, "ls-files", "--stage", "-z", "--", rel)
-	if err != nil {
-		return "", "", false, err
-	}
-	n := 0
-	for _, raw := range bytes.Split(out, []byte{0}) {
-		if len(raw) == 0 {
-			continue
-		}
-		tab := bytes.IndexByte(raw, '\t')
-		if tab < 0 {
-			return "", "", false, fmt.Errorf("%w: unreadable index entry", ErrDirtyWorkRejected)
-		}
-		fields := bytes.Fields(raw[:tab])
-		if len(fields) < 3 {
-			return "", "", false, fmt.Errorf("%w: unreadable index entry", ErrDirtyWorkRejected)
-		}
-		if string(fields[2]) != "0" {
-			return "", "", false, nil
-		}
-		mode = string(fields[0])
-		sha = string(fields[1])
-		n++
-	}
-	if n != 1 {
-		return "", "", false, nil
-	}
-	return mode, sha, true, nil
-}
-
-func worktreeBlob(ctx context.Context, wt, rel, full string, info os.FileInfo) (mode, sha string, err error) {
+func worktreeBlob(ctx context.Context, wt, full string, info os.FileInfo) (mode, sha string, err error) {
 	if info.Mode()&os.ModeSymlink != 0 {
 		target, err := os.Readlink(full)
 		if err != nil {
@@ -378,7 +333,7 @@ func worktreeBlob(ctx context.Context, wt, rel, full string, info os.FileInfo) (
 	if info.Mode()&0o111 != 0 {
 		mode = "100755"
 	}
-	sha, err = Run(ctx, wt, "hash-object", "--path="+filepath.ToSlash(rel), "--", full)
+	sha, err = Run(ctx, wt, "hash-object", "--no-filters", "--", full)
 	return mode, sha, err
 }
 
@@ -649,6 +604,7 @@ func secretPath(rel string) bool {
 
 var privateKeyMarkers = [][]byte{
 	[]byte("-----BEGIN PRIVATE KEY-----"),
+	[]byte("-----BEGIN ENCRYPTED PRIVATE KEY-----"),
 	[]byte("-----BEGIN RSA PRIVATE KEY-----"),
 	[]byte("-----BEGIN OPENSSH PRIVATE KEY-----"),
 	[]byte("-----BEGIN EC PRIVATE KEY-----"),
@@ -821,12 +777,34 @@ func stageSnapshot(ctx context.Context, tmpDir, rel, full string) (mode, tmpPath
 	return mode, dst.Name(), "", nil
 }
 
-func scanStagedBlobs(ctx context.Context, wt, indexFile string) error {
-	out, err := runInDirWithEnvAndInputRaw(ctx, wt, []string{"GIT_INDEX_FILE=" + indexFile}, "", "diff-index", "--cached", "-z", "HEAD")
+func rejectIndexIntent(ctx context.Context, wt string, env []string) error {
+	visible, err := runInDirWithEnvRaw(ctx, wt, env, "diff", "--cached", "--raw", "-z", "--no-renames", "--ita-visible-in-index", "HEAD")
 	if err != nil {
-		return fmt.Errorf("read staged changes: %w", err)
+		return err
 	}
-	return walkStagedBlobs(out, func(path, sha string) error {
+	invisible, err := runInDirWithEnvRaw(ctx, wt, env, "diff", "--cached", "--raw", "-z", "--no-renames", "--ita-invisible-in-index", "HEAD")
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(visible, invisible) {
+		return fmt.Errorf("%w: intent-to-add entries cannot be restored from snapshot trees", ErrDirtyWorkRejected)
+	}
+	return nil
+}
+
+func scanIndexBlobs(ctx context.Context, wt, indexFile string) error {
+	env := []string{"GIT_INDEX_FILE=" + indexFile}
+	if err := rejectIndexIntent(ctx, wt, env); err != nil {
+		return err
+	}
+	out, err := runInDirWithEnvRaw(ctx, wt, env, "ls-files", "--stage", "-z")
+	if err != nil {
+		return fmt.Errorf("read copied index: %w", err)
+	}
+	return walkIndexBlobs(out, func(mode, path, sha string) error {
+		if secretPath(path) {
+			return fmt.Errorf("%w: %s is secret-bearing", ErrDirtyWorkRejected, path)
+		}
 		found, err := gitStreamContainsSecret(ctx, wt, "cat-file", "blob", sha)
 		if err != nil {
 			return fmt.Errorf("read index %s: %w", path, err)
@@ -838,49 +816,28 @@ func scanStagedBlobs(ctx context.Context, wt, indexFile string) error {
 	})
 }
 
-func walkStagedBlobs(out []byte, fn func(path, sha string) error) error {
-	for len(out) > 0 {
-		metaEnd := bytes.IndexByte(out, 0)
-		if metaEnd < 0 {
-			return fmt.Errorf("%w: unreadable staged diff", ErrDirtyWorkRejected)
-		}
-		meta := out[:metaEnd]
-		out = out[metaEnd+1:]
-		pathEnd := bytes.IndexByte(out, 0)
-		if pathEnd < 0 {
-			return fmt.Errorf("%w: unreadable staged diff", ErrDirtyWorkRejected)
-		}
-		path := string(out[:pathEnd])
-		out = out[pathEnd+1:]
-		fields := bytes.Fields(meta)
-		if len(fields) < 5 {
-			return fmt.Errorf("%w: unreadable staged diff", ErrDirtyWorkRejected)
-		}
-		status := string(fields[4])
-		sha := string(fields[3])
-		if status == "D" || zeroSHA(sha) {
+func walkIndexBlobs(out []byte, fn func(mode, path, sha string) error) error {
+	for _, raw := range bytes.Split(out, []byte{0}) {
+		if len(raw) == 0 {
 			continue
 		}
-		if status[0] == 'R' || status[0] == 'C' {
-			return fmt.Errorf("%w: rename or copy in the index; refusing a partial snapshot", ErrDirtyWorkRejected)
+		tab := bytes.IndexByte(raw, '\t')
+		if tab < 0 {
+			return fmt.Errorf("%w: unreadable index entry", ErrDirtyWorkRejected)
 		}
-		if err := fn(path, sha); err != nil {
+		fields := bytes.Fields(raw[:tab])
+		if len(fields) != 3 || string(fields[2]) != "0" {
+			return fmt.Errorf("%w: index entry is not a resolved blob", ErrDirtyWorkRejected)
+		}
+		path, err := cleanCheckoutRel(string(raw[tab+1:]))
+		if err != nil {
+			return err
+		}
+		if err := fn(string(fields[0]), path, string(fields[1])); err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-func zeroSHA(sha string) bool {
-	if sha == "" {
-		return true
-	}
-	for _, c := range sha {
-		if c != '0' {
-			return false
-		}
-	}
-	return true
 }
 
 // errSecretScanStop ends the stdout copy once a private-key marker is in hand.
@@ -914,29 +871,34 @@ func (s *secretStreamScanner) Write(p []byte) (int, error) {
 }
 
 func gitStreamContainsSecret(ctx context.Context, dir string, args ...string) (bool, error) {
+	scan := &secretStreamScanner{ctx: ctx}
+	err := gitStreamTo(ctx, dir, scan, args...)
+	if scan.found {
+		return true, nil
+	}
+	return false, err
+}
+
+func gitStreamTo(ctx context.Context, dir string, dst io.Writer, args ...string) error {
 	if isBareGitDir(dir) {
 		args = append([]string{"--git-dir=" + dir}, args...)
 	}
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	cmd.Env = nonInteractiveEnvForContext(ctx, dir)
-	scan := &secretStreamScanner{ctx: ctx}
-	cmd.Stdout = scan
+	cmd.Stdout = dst
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	winproc.Harden(cmd)
 	shellenv.ConfigureShellCommand(cmd)
 	err := shellenv.RunShellCommand(cmd)
-	if scan.found {
-		return true, nil
-	}
 	if err != nil {
 		if ctx.Err() != nil {
-			return false, ctx.Err()
+			return ctx.Err()
 		}
-		return false, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		return fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
-	return false, nil
+	return nil
 }
 
 func writeDirtySnapshot(ctx context.Context, req DirtyWorkRequest, ref string, entries []dirtyEntry) (*DirtyWorkSnapshot, error) {
@@ -975,7 +937,7 @@ func writeDirtySnapshot(ctx context.Context, req DirtyWorkRequest, ref string, e
 	if liveTree != indexTree {
 		return nil, fmt.Errorf("index changed while capturing dirty work")
 	}
-	if err := scanStagedBlobs(ctx, wt, indexCopy); err != nil {
+	if err := scanIndexBlobs(ctx, wt, indexCopy); err != nil {
 		return nil, err
 	}
 
@@ -1164,7 +1126,7 @@ func indexInfo(ctx context.Context, wt string, prepared []preparedEntry, include
 		if !include(path) {
 			continue
 		}
-		blob, err := hashPrepared(ctx, wt, path, true)
+		blob, err := hashPrepared(ctx, wt, path)
 		if err != nil {
 			return "", fmt.Errorf("hash %s: %w", path.rel, err)
 		}
@@ -1173,24 +1135,24 @@ func indexInfo(ctx context.Context, wt string, prepared []preparedEntry, include
 	return info.String(), nil
 }
 
-func hashPrepared(ctx context.Context, wt string, path preparedEntry, write bool) (string, error) {
-	args := []string{"hash-object"}
-	if write {
-		args = append(args, "-w")
-	}
+func hashPrepared(ctx context.Context, wt string, path preparedEntry) (string, error) {
+	args := []string{"hash-object", "-w", "--no-filters"}
 	if path.mode == "120000" {
-		args = append(args, "--no-filters", "--stdin")
+		args = append(args, "--stdin")
 		return runInDirWithEnvAndInput(ctx, wt, nil, path.link, args...)
 	}
 	if path.tmp == "" {
 		return "", fmt.Errorf("%w: %s has no staged bytes", ErrDirtyWorkRejected, path.rel)
 	}
-	args = append(args, "--path="+filepath.ToSlash(path.rel), "--", path.tmp)
+	args = append(args, "--", path.tmp)
 	return Run(ctx, wt, args...)
 }
 
 func recheckDirtyWork(ctx context.Context, wt, tmp, head, indexTree, workTree, untrackedTree string) error {
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := rejectIndexIntent(ctx, wt, nil); err != nil {
 		return err
 	}
 	if err := rejectNonSnapshotable(ctx, wt); err != nil {
@@ -1236,11 +1198,54 @@ func worktreeEqualsSnapshot(ctx context.Context, wt, tmp, workTree, untrackedTre
 			}
 		}
 	}
+	blobs, err := runInDirWithEnvRaw(ctx, wt, env, "ls-files", "--stage", "-z")
+	if err != nil {
+		return err
+	}
+	if err := walkIndexBlobs(blobs, func(mode, path, sha string) error {
+		if mode == "120000" {
+			return nil
+		}
+		restored, err := os.CreateTemp(tmp, "restored-")
+		if err != nil {
+			return err
+		}
+		err = gitStreamTo(ctx, wt, restored, "cat-file", "--filters", "--path="+filepath.ToSlash(path), sha)
+		closeErr := restored.Close()
+		if err != nil {
+			return err
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		restoredSHA, err := Run(ctx, wt, "hash-object", "--no-filters", "--", restored.Name())
+		if err != nil {
+			return err
+		}
+		if restoredSHA != sha {
+			return fmt.Errorf("%w: Git conversion changes restored bytes for %s", ErrDirtyWorkRejected, path)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
 	out, err := runInDirWithEnvAndInputRaw(ctx, wt, env, "", gitStatusArgs()...)
 	if err != nil {
 		return err
 	}
-	return statusMatchesSnapshot(out)
+	if err := statusMatchesSnapshot(out); err != nil {
+		return err
+	}
+	return walkIndexBlobs(blobs, func(mode, path, sha string) error {
+		differs, _, err := trackedPathDiffers(ctx, wt, path, mode, sha)
+		if err != nil {
+			return err
+		}
+		if differs {
+			return fmt.Errorf("%w: snapshot bytes differ from %s", ErrDirtyWorkRejected, path)
+		}
+		return nil
+	})
 }
 
 func untrackedIndexInfo(ctx context.Context, wt, tree string) ([]byte, error) {
