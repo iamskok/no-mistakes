@@ -87,7 +87,7 @@ func TestReapWorktreesHonorsRetentionAndSparesActiveRuns(t *testing.T) {
 	activePending := f.seed("active-pending", types.RunPending, 30*24*time.Hour)
 	activeRunning := f.seed("active-running", types.RunRunning, 30*24*time.Hour)
 
-	reapWorktrees(f.db, f.p, worktreeReapPolicy{Retention: 14 * 24 * time.Hour}, time.Now())
+	reapWorktrees(context.Background(), f.db, f.p, worktreeReapPolicy{Retention: 14 * 24 * time.Hour}, time.Now())
 
 	if !f.exists(fresh) {
 		t.Error("a worktree inside the retention window was removed")
@@ -113,7 +113,7 @@ func TestReapWorktreesTrimsToTheRunCeilingOldestFirst(t *testing.T) {
 	middle := f.seed("middle", types.RunCompleted, 3*time.Hour)
 	newest := f.seed("newest", types.RunCompleted, time.Hour)
 
-	reapWorktrees(f.db, f.p, worktreeReapPolicy{Retention: 14 * 24 * time.Hour, MaxRuns: 2}, time.Now())
+	reapWorktrees(context.Background(), f.db, f.p, worktreeReapPolicy{Retention: 14 * 24 * time.Hour, MaxRuns: 2}, time.Now())
 
 	if f.exists(oldest) {
 		t.Error("the oldest leftover worktree survived the run ceiling")
@@ -131,7 +131,7 @@ func TestReapWorktreesKeepsEverythingWhenBothBoundsAreDisabled(t *testing.T) {
 	ancient := f.seed("ancient", types.RunCompleted, 365*24*time.Hour)
 	recent := f.seed("recent", types.RunCompleted, time.Hour)
 
-	reapWorktrees(f.db, f.p, worktreeReapPolicy{Retention: 0, MaxRuns: 0}, time.Now())
+	reapWorktrees(context.Background(), f.db, f.p, worktreeReapPolicy{Retention: 0, MaxRuns: 0}, time.Now())
 
 	if !f.exists(ancient) || !f.exists(recent) {
 		t.Error("worktrees were reaped even though both bounds are disabled")

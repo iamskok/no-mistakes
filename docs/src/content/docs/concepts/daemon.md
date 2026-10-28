@@ -98,6 +98,8 @@ Before that removal, a checkout with staged changes, unstaged changes, or untrac
 
 Automatic cleanup currently retains every real checkout, including a clean one or one with a matching snapshot: trailing scans cannot prove stability through deletion while an independent writer can change HEAD, the index, conversion configuration, files, or membership. Both run cleanup and startup/orphan cleanup record that refusal rather than deleting unproven work. The cleanup mutex serializes cleanup passes; it does not exclude independent writers. A concurrent-writer capture guarantee and the coordination needed to prove it are outside this preservation change. Verified restoration or refusal is the supported safety boundary.
 
+Startup worktree cleanup shares a 10-second deadline across the default-tree and recorded-worktree sweeps, including capture and confirmation for their serial candidates. When that deadline expires, unfinished checkouts stay in place and startup continues.
+
 For restoration, read `restore-core-autocrlf` and `restore-core-eol` from `git show -s --format=%B <snapshot-commit>`. These record the capture's line-ending settings, including checkout-specific overrides; native line endings are recorded as `lf` or `crlf`. Substitute those saved values in **both** commands below. Creating the replacement checkout with them avoids inheriting different line endings after the original worktree's configuration is deleted.
 
 ```sh

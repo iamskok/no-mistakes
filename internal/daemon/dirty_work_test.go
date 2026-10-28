@@ -156,14 +156,14 @@ func TestConfirmDirtyWorkBeforeRemovalRetainsUnprovenCheckouts(t *testing.T) {
 				}
 			}
 			const runID = "01JZ8XQ7V6K9M3B0T5N2R4C8YD"
-			snap, err := captureDirtyWorkBeforeRemoval(gate, wt, runID, head)
+			snap, err := captureDirtyWorkBeforeRemoval(context.Background(), gate, wt, runID, head)
 			if err != nil || (snap == nil) != (state == "clean") {
 				t.Fatalf("capture = %#v, %v", snap, err)
 			}
 			if err := git.DirtyWorkStillMatches(context.Background(), wt, snap); err != nil {
 				t.Fatalf("fixture does not match its capture: %v", err)
 			}
-			if err := confirmDirtyWorkBeforeRemoval(wt, snap); err == nil || !strings.Contains(err.Error(), "stability through removal cannot be proven") {
+			if err := confirmDirtyWorkBeforeRemoval(context.Background(), wt, snap); err == nil || !strings.Contains(err.Error(), "stability through removal cannot be proven") {
 				t.Fatalf("unproven cleanup did not record its retention reason: %v", err)
 			}
 			removed := removeOrphanWorktree(context.Background(), orphanWorktree{gateDir: gate, dir: wt, repoID: "repo1", runID: runID, baseSHA: head})

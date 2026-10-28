@@ -102,7 +102,7 @@ func TestProtectedPathRefusalCancellationCleanup(t *testing.T) {
 					t.Fatalf("unexpected supersession: %+v", run)
 				}
 				assertProtectedWorktreePreserved(t, workDir, head)
-				cleanupOrphanWorktrees(database, p, nil)
+				cleanupOrphanWorktrees(context.Background(), database, p, nil)
 				assertProtectedWorktreePreserved(t, workDir, head)
 				return
 			}
@@ -158,7 +158,7 @@ func TestProtectedPathRefusalSurvivesShutdownCleanup(t *testing.T) {
 	}
 	workDir := p.WorktreeDir(repo.ID, result.RunID)
 	assertProtectedWorktreePreserved(t, workDir, head)
-	cleanupOrphanWorktrees(database, p, nil)
+	cleanupOrphanWorktrees(context.Background(), database, p, nil)
 	assertProtectedWorktreePreserved(t, workDir, head)
 }
 
@@ -230,7 +230,7 @@ func TestProtectedPathRefusalSurvivesFailedTrustedRecovery(t *testing.T) {
 			}
 			recoverOnStartup(database, p, mgr, layout)
 			assertProtectedWorktreePreserved(t, workDir, head)
-			cleanupOrphanWorktrees(database, p, nil)
+			cleanupOrphanWorktrees(context.Background(), database, p, nil)
 			assertProtectedWorktreePreserved(t, workDir, head)
 			if len(mgr.executors) != 0 {
 				t.Fatal("failed trusted config launched an executor")
@@ -407,7 +407,7 @@ func TestProtectedPathPushApprovalCannotSkipPublicationOrDiscardEdits(t *testing
 		t.Fatalf("published head = %s, want %s", got, headSHA)
 	}
 	t.Logf("after explicit resolution + respond fix: run=%s last_pushed_sha=%s bare-remote feature=%s", run.Status, *run.LastPushedSHA, gitOutput(t, publicationDir, "rev-parse", "refs/heads/feature"))
-	if err := confirmDirtyWorkBeforeRemoval(workDir, nil); err == nil {
+	if err := confirmDirtyWorkBeforeRemoval(context.Background(), workDir, nil); err == nil {
 		t.Fatal("successful publication authorized cleanup without a stability proof")
 	}
 	if _, err := os.Stat(workDir); err != nil {

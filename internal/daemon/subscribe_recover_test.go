@@ -568,7 +568,7 @@ func TestRecoverOnStartup_ResumesParkedRun(t *testing.T) {
 	if completed.ReviewApprovedHeadSHA == nil || *completed.ReviewApprovedHeadSHA != headSHA {
 		t.Fatalf("recovered review approval = %#v, want %s", completed.ReviewApprovedHeadSHA, headSHA)
 	}
-	if err := confirmDirtyWorkBeforeRemoval(worktree, nil); err == nil {
+	if err := confirmDirtyWorkBeforeRemoval(context.Background(), worktree, nil); err == nil {
 		t.Fatal("recovered run authorized cleanup without a stability proof")
 	}
 	if _, err := os.Stat(worktree); err != nil {

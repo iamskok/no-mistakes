@@ -64,13 +64,16 @@ func worktreeReapPolicyFor(global *config.GlobalConfig) worktreeReapPolicy {
 // operator-configured worktree_roots placement is the operator's own
 // directory, and startup cleanup attempts its recorded leftovers once per
 // startup under the same preservation rule.
-func reapWorktrees(d *db.DB, p *paths.Paths, policy worktreeReapPolicy, now time.Time) {
-	removable, _ := defaultTreeOrphanWorktrees(d, p)
+func reapWorktrees(ctx context.Context, d *db.DB, p *paths.Paths, policy worktreeReapPolicy, now time.Time) {
+	if ctx.Err() != nil {
+		return
+	}
+	removable, _ := defaultTreeOrphanWorktrees(ctx, d, p)
 	if len(removable) == 0 {
 		return
 	}
-	toRemove := worktreeReapCandidates(removable, policy, now)
-	if len(toRemove) == 0 {
+	toRemove := worktreeReapCandidates(ctx, removable, policy, now)
+	if len(toRemove) == 0 || ctx.Err() != nil {
 		return
 	}
 
@@ -85,7 +88,10 @@ func reapWorktrees(d *db.DB, p *paths.Paths, policy worktreeReapPolicy, now time
 
 	removed := 0
 	for _, wt := range toRemove {
-		if removeOrphanWorktree(context.Background(), wt) {
+		if ctx.Err() != nil {
+			break
+		}
+		if removeOrphanWorktree(ctx, wt) {
 			removed++
 		}
 	}
@@ -103,13 +109,16 @@ func reapWorktrees(d *db.DB, p *paths.Paths, policy worktreeReapPolicy, now time
 // retainedDefaultTreeRunIDs in daemon.go), so a worktree the policy is
 // keeping is never treated as orphaned by one caller while the other retains
 // it.
-func worktreeReapCandidates(removable []orphanWorktree, policy worktreeReapPolicy, now time.Time) []orphanWorktree {
+func worktreeReapCandidates(ctx context.Context, removable []orphanWorktree, policy worktreeReapPolicy, now time.Time) []orphanWorktree {
 	type candidate struct {
 		wt      orphanWorktree
 		modTime time.Time
 	}
 	candidates := make([]candidate, 0, len(removable))
 	for _, wt := range removable {
+		if ctx.Err() != nil {
+			return nil
+		}
 		info, err := os.Stat(wt.dir)
 		if err != nil {
 			continue

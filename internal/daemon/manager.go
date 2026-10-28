@@ -732,7 +732,7 @@ func (m *RunManager) cleanupRunEvidence(cfg *config.Config, runID string) {
 	}
 	now := time.Now()
 	reapEvidence(m.db, root, policy, now)
-	reapWorktrees(m.db, m.paths, wtPolicy, now)
+	reapWorktrees(context.Background(), m.db, m.paths, wtPolicy, now)
 	reapRunLogs(m.db, m.paths.LogsDir(), policy, now)
 }
 
@@ -772,12 +772,12 @@ func (m *RunManager) removeRunWorktree(repoID, runID, gateDir, wtDir, reason str
 	// lets a second pass snapshot a newer edit, delete the checkout, and
 	// then lose that snapshot when this pass publishes the older ref.
 	_ = git.WithDirtyWorkCheckout(wtDir, func() error {
-		snap, err := captureDirtyWorkBeforeRemoval(gateDir, wtDir, runID, baseSHA)
+		snap, err := captureDirtyWorkBeforeRemoval(context.Background(), gateDir, wtDir, runID, baseSHA)
 		if err != nil {
 			slog.Warn("preserving run worktree: unique uncommitted work was not captured", "run_id", runID, "path", wtDir, "reason", reason, "error", err)
 			return err
 		}
-		if err := confirmDirtyWorkBeforeRemoval(wtDir, snap); err != nil {
+		if err := confirmDirtyWorkBeforeRemoval(context.Background(), wtDir, snap); err != nil {
 			slog.Warn("preserving run worktree: cleanup verification refused", "run_id", runID, "path", wtDir, "reason", reason, "error", err)
 			return err
 		}
