@@ -103,7 +103,7 @@ func ProjectPathFromMRURL(raw string) string {
 // login spelling - so identity comes from the registered review-bot logins
 // (scm.IsReviewBotLogin), never from an application name.
 func (h *Host) GetReviewComments(ctx context.Context, pr *scm.PR) ([]scm.ReviewComment, error) {
-	project, iid, err := h.reviewCommentTarget(pr)
+	project, iid, err := h.reviewCommentTarget(ctx, pr)
 	if err != nil {
 		return nil, err
 	}
@@ -178,7 +178,7 @@ func reviewCommentURL(pr *scm.PR, noteID int) string {
 // was built without the coordinates this read needs, which is the same
 // "provider cannot supply comments" answer a provider without the capability
 // gives, not a failed read to park on.
-func (h *Host) reviewCommentTarget(pr *scm.PR) (string, int, error) {
+func (h *Host) reviewCommentTarget(ctx context.Context, pr *scm.PR) (string, int, error) {
 	if pr == nil {
 		return "", 0, errors.New("pr is nil")
 	}
@@ -188,7 +188,7 @@ func (h *Host) reviewCommentTarget(pr *scm.PR) (string, int, error) {
 		number = parsed
 	}
 	if pr.URL != "" {
-		parsed, err := parseMergeRequestURL(pr.URL, h.host, project)
+		parsed, err := h.parseMergeRequestURL(ctx, pr.URL)
 		if err != nil {
 			return "", 0, err
 		}

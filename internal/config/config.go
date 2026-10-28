@@ -401,6 +401,9 @@ type RepoConfig struct {
 	Agents         []types.AgentName `yaml:"-"`
 	Commands       Commands          `yaml:"commands"`
 	IgnorePatterns []string          `yaml:"ignore_patterns"`
+	// TrustedIgnorePatterns preserves the default branch's authorized exclusions
+	// when review instructions override exclusions from the pushed branch.
+	TrustedIgnorePatterns []string `yaml:"-"`
 	// ProtectedPaths prevents automatic staging of dirty matching paths. It is
 	// trusted-only, regardless of allow_repo_commands, so a pushed branch cannot
 	// remove the maintainer's protection from its own fixes.
@@ -960,6 +963,8 @@ type Config struct {
 	NoCI bool
 	// Providers holds the resolved provider-specific settings.
 	Providers Providers
+	// TrustedIgnorePatterns is the default branch's authorized review exclusions.
+	TrustedIgnorePatterns []string
 }
 
 // ProvidersRaw is the YAML representation of provider-specific settings,
@@ -3326,7 +3331,9 @@ func EffectiveRepoConfig(pushed, trusted *RepoConfig, allowRepoCommands bool) *R
 		pushed = &RepoConfig{}
 	}
 	effective := *pushed
+	effective.TrustedIgnorePatterns = nil
 	if trusted != nil {
+		effective.TrustedIgnorePatterns = append([]string(nil), trusted.IgnorePatterns...)
 		effective.Document = trusted.Document
 		effective.ProtectedPaths = append([]string(nil), trusted.ProtectedPaths...)
 		// review.path_instructions steers the gate agent that reviews the pushed
@@ -4129,6 +4136,7 @@ func merge(global *GlobalConfig, repo *RepoConfig, override *RepositoryOverride)
 		// trusted-only (EffectiveRepoConfig sourced it from the trusted copy).
 		DisableProjectSettings: repo.DisableProjectSettings,
 		NoCI:                   repo.NoCI,
+		TrustedIgnorePatterns:  append([]string(nil), repo.TrustedIgnorePatterns...),
 	}
 
 	// repo.Review is trusted-only (EffectiveRepoConfig). The repository value

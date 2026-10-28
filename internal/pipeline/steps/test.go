@@ -24,6 +24,17 @@ var _ pipeline.ApprovalOverrideVerifier = (*TestStep)(nil)
 
 func (s *TestStep) Name() types.StepName { return types.StepTest }
 
+// Both turns need the same scope: the repair turn leaves an unauthorized
+// remedy unapplied, and the evidence turn reports the unresolved failure.
+const testRepairScopeRules = `
+
+Repair scope:
+- Tests or product code, including shared libraries and prompts, may be fixed when the repair is required by the change under validation and respects its intent.
+- Do not tune product logic or prompts to a single scenario's literal wording or scripted ordering. Derive the expected behavior from the intended product contract, not from the scenario's exact inputs.
+- If the proposed repair would contradict explicit intent, edit a file the intent puts off limits, or change product policy beyond the change under validation, do not apply or commit that repair. Leave the failure unresolved for a human decision. Later recorded human decisions supersede conflicting original intent.
+- In a repair turn, leave such a repair unapplied and summarize the unresolved failure. The following evidence turn must reassess unresolved failures under these same scope rules.
+- In the evidence turn, when resolving a failure would require such a repair, report a warning finding with action "ask-user" instead of making the repair. Name the proposed repair and the intent restriction or product-policy change that needs a human decision. Do not classify that repair as "auto-fix".`
+
 func (s *TestStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, error) {
 	if err := assertPipelineHeadContinuity(sctx, s.Name()); err != nil {
 		return nil, err
@@ -100,7 +111,7 @@ Rules:
 			testRunbookSections(sctx),
 			fixSummaryRules(sctx, s.Name()),
 			historySection,
-		)
+		) + testRepairScopeRules
 		if repair := testRepairFindings(sctx.PreviousFindings); repair != "" {
 			fixPrompt += `
 
@@ -308,7 +319,7 @@ Rules:
 		fallbackGuidance,
 		reassessHistory,
 		agent.MemoryFilesRule,
-	)
+	) + testRepairScopeRules
 	findings, err := runTestAnalyzer(sctx, evidencePrompt)
 	if err != nil {
 		if errors.Is(err, errTestAgentTimeout) {

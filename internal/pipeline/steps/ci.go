@@ -70,6 +70,8 @@ type CIStep struct {
 	observedCompletedAt  map[string]checkFreshness // terminally failed check freshness at the observation whose findings a fix round may repair
 	pendingFixSummary    string                    // one-line summary of the repair this execution published, attached to the outcome it ends with
 	pendingRepairPublish bool
+	fixAgentCrashes      int
+	lastFixAgentCrash    string
 	transientReruns      checkRerunBudget // per-check rerun budget spent on provider-reported transient failures
 	pollIntervalOverride time.Duration    // if set, overrides computed poll interval (for testing)
 	waitForNextPoll      func(context.Context, time.Duration) error
@@ -316,6 +318,27 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 	repairRequested := sctx.Fixing && !retryRefusal
 	defer func() {
 		if outcome != nil {
+			if s.fixAgentCrashes > 0 {
+				findings, parseErr := types.ParseFindingsJSON(outcome.Findings)
+				if outcome.Findings == "" || parseErr == nil {
+					// Deferred findings may already contain the previous round's
+					// diagnostic. Replace it with the latest cumulative count and cause.
+					items := findings.Items[:0]
+					for _, item := range findings.Items {
+						if item.ID != "ci-fix-agent-crashes" {
+							items = append(items, item)
+						}
+					}
+					findings.Items = items
+					findings.Items = append(findings.Items, Finding{
+						ID:          "ci-fix-agent-crashes",
+						Severity:    types.FindingSeverityInfo,
+						Action:      types.ActionNoOp,
+						Description: fmt.Sprintf("%d CI fix-agent crashes; last cause: %s", s.fixAgentCrashes, s.lastFixAgentCrash),
+					})
+					outcome.Findings, _ = types.MarshalFindingsJSON(findings)
+				}
+			}
 			if s.pendingFixSummary != "" {
 				outcome.FixSummary = s.pendingFixSummary
 			}
