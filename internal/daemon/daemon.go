@@ -477,8 +477,8 @@ func recoverOnStartup(d *db.DB, p *paths.Paths, mgr *RunManager, layout *worktre
 	// <NM_HOME>/worktrees tree before cleanupOrphanWorktrees sweeps
 	// operator-placed (worktree_roots) leftovers, so a disabled or wide
 	// retention window is honored on the default tree instead of being
-	// bypassed by startup cleanup. Both still leave a checkout whose
-	// dirty-work snapshot cannot be made.
+	// bypassed by startup cleanup. Both preserve real checkouts even when
+	// clean or successfully snapshotted, because removal stability is unproven.
 	worktreeStarted := time.Now()
 	reapWorktrees(d, p, wtPolicy, now)
 	cleanupOrphanWorktrees(d, p, leftover)
@@ -603,9 +603,9 @@ func sweepOrphanRunProcesses(d *db.DB, p *paths.Paths, worktrees []procreap.Work
 	}, "daemon_startup")
 }
 
-// retainedDefaultTreeRunIDs is the run IDs of default-tree worktrees the
-// worktree retention policy is keeping. The startup process sweep runs before
-// reapWorktrees decides what to remove, so it consults the same decision here
+// retainedDefaultTreeRunIDs identifies default-tree worktrees outside the
+// policy's cleanup candidates. The startup process sweep runs before
+// reapWorktrees attempts cleanup, so it consults the same selection here
 // rather than treating "run is terminal" alone as orphaned - otherwise a
 // restart could kill a process still using a checkout the operator configured
 // to retain (see worktreeReapCandidates).
@@ -802,12 +802,13 @@ func reportUnusableWorktreeRoots(d *db.DB, layout *worktrees.Layout) {
 	}
 }
 
-// cleanupOrphanWorktrees removes worktree directories left behind by runs
+// cleanupOrphanWorktrees attempts cleanup of directories left behind by runs
 // that are no longer active, for the operator-placed leftovers named by
 // recordedOrphanWorktrees (see worktree_roots in the global config) - that
-// directory is the operator's own, so every eligible leftover there is
-// removed once, at startup, after the same dirty-work snapshot as
-// finished-run cleanup. A checkout whose snapshot cannot be made stays.
+// directory is the operator's own, so only recorded leftovers are considered
+// once at startup. As in finished-run cleanup, real checkouts are retained
+// even when clean or successfully snapshotted: stability through removal is
+// unproven. Configured cleanup budgets cannot ensure their reclamation.
 // It is DB-aware: a worktree is
 // only removed when its run row is terminal, or when there is no matching
 // run row at all. This is what keeps cleanup from deleting the checkout out
@@ -817,9 +818,9 @@ func reportUnusableWorktreeRoots(d *db.DB, layout *worktrees.Layout) {
 // sees has already been resolved to a terminal status.
 //
 // Leftovers under the default <NM_HOME>/worktrees tree are NOT removed here:
-// that tree is bounded by the operator's retention policy via reapWorktrees,
-// which recoverOnStartup runs first, so this only reclaims the (now likely
-// empty) per-repo directories reapWorktrees left behind.
+// that tree has its cleanup candidates selected by reapWorktrees, which
+// recoverOnStartup runs first. This only removes per-repo directories that
+// are empty after that pass; retained checkouts keep their parents nonempty.
 //
 // Every directory it is going to remove is swept in ONE process snapshot before
 // any of them is removed. The sweep-before-removal invariant is what matters
@@ -1031,19 +1032,16 @@ func removeOrphanWorktree(ctx context.Context, wt orphanWorktree) bool {
 // pruned) are eligible for removal. RunManager.startRun always inserts the
 // run row before creating the worktree directory, so on a single daemon a
 // "no matching run" directory is eligible immediately: its insert has already
-// landed or the row is gone. removeOrphanWorktree keeps a checkout whose
-// unique uncommitted work cannot be snapshotted.
+// landed or the row is gone. Eligibility does not override the preservation
+// refusal: removeOrphanWorktree retains every real checkout.
 //
 // A run marked RunCIMonitorInterrupted (the daemon restarted while monitoring
-// CI for an already-open PR, issue #361) is terminal and would otherwise leak
-// its checkout on every future restart. Such a worktree is reclaimed like any
-// other terminal-run leftover EXCEPT when it may hold unpushed work: a CI
-// auto-fix commits locally before pushing (see steps/ci_fix.go), so a crash in
-// that window leaves the only copy of the fix commit in this checkout. We
-// reclaim only when the worktree HEAD equals the head the run already pushed -
-// run.HeadSHA advances solely after a verified push, so a match proves nothing
-// local is unpushed - and fail safe to preservation on any mismatch or
-// unreadable HEAD so recoverable commits are never discarded.
+// CI for an already-open PR, issue #361) is terminal but may hold unpushed
+// work: a CI auto-fix commits locally before pushing (see steps/ci_fix.go).
+// A crash in that window leaves the only copy of the fix commit in this
+// checkout. Cleanup eligibility requires HEAD to match run.HeadSHA, which
+// advances solely after a verified push. A mismatch or unreadable HEAD keeps
+// recoverable commits from being discarded.
 func skipWorktreeCleanup(ctx context.Context, d *db.DB, runID, wtPath string) (bool, string) {
 	run, err := d.GetRun(runID)
 	if err != nil {

@@ -13,10 +13,11 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/procreap"
 )
 
-// worktreeReapPolicy bounds how many leftover run-worktree directories
-// survive under the default <NM_HOME>/worktrees tree. A zero Retention
-// disables age-based reaping and a zero MaxRuns disables the count ceiling,
-// matching evidenceReapPolicy.
+// worktreeReapPolicy selects leftover directories for attempted cleanup under
+// the default <NM_HOME>/worktrees tree. Preservation refusals override these
+// budgets, so retained real checkouts can exceed them. A zero Retention
+// disables age-based selection and a zero MaxRuns disables count-based
+// selection.
 type worktreeReapPolicy struct {
 	Retention time.Duration
 	MaxRuns   int
@@ -40,38 +41,29 @@ func worktreeReapPolicyFor(global *config.GlobalConfig) worktreeReapPolicy {
 	return policy
 }
 
-// reapWorktrees bounds leftover run-worktree directories under the default
-// <NM_HOME>/worktrees tree (issue #1093).
+// reapWorktrees attempts cleanup of selected leftover directories under the
+// default <NM_HOME>/worktrees tree (issue #1093).
 //
-// A finished run removes its worktree after a verified snapshot of unique
-// uncommitted work, or when the checkout is clean
-// (RunManager.removeRunWorktree), so on the common path there is nothing here
-// to reap. This exists for the uncommon path: a `git worktree remove` failure
-// (e.g. a vendored/nested .git under a large node_modules tree), a
-// protected-path refusal that later became removable, or a checkout kept
-// because that snapshot could not be made. Each leaves a directory that
-// immediate removal never retries. Startup runs this function again, once,
-// and still leaves a checkout whose snapshot cannot be made. On a long-lived
-// install that startup can be weeks away, which is exactly the "long-running
-// host" accumulation the issue reports. Calling
-// this after every run's own cleanup (see RunManager.cleanupRunEvidence)
-// converges a live daemon on the same budget without waiting for a restart.
+// It runs after each finished run (RunManager.cleanupRunEvidence) and at
+// startup. Both paths retain real checkouts, even when clean or successfully
+// snapshotted, because stability through removal is unproven. Age and count
+// budgets therefore cannot ensure reclamation until a separate stability
+// proof exists. Leftover directories that are not checkouts remain removable.
 //
 // It reuses defaultTreeOrphanWorktrees for directory discovery and
 // eligibility (never a directory whose run is still pending/running, still
 // protected, or unpushed after a CI-monitor interruption - see
-// skipWorktreeCleanup and protectedPathCleanupReason), then applies the same
-// two-rule bound reapEvidence applies to evidence: an eligible directory
-// older than the retention window is selected, and whatever survives that
-// cut is trimmed to the run ceiling, oldest first. removeOrphanWorktree
-// leaves a selected checkout whose snapshot still cannot be made. Unlike
-// evidence, an eligible worktree is never removed merely for being "empty" -
+// skipWorktreeCleanup and protectedPathCleanupReason). Eligible directories
+// older than the retention window are selected first, followed by enough
+// remaining directories to meet the count target, oldest first.
+// removeOrphanWorktree can refuse every selected checkout; selection is not
+// proof of removal. Unlike evidence, an eligible worktree is never removed
+// merely for being "empty" -
 // a real checkout is never empty, so there is nothing analogous to
 // reapEvidence's empty-run case. Only the default tree is scanned: an
 // operator-configured worktree_roots placement is the operator's own
-// directory, and startup cleanup reclaims a recorded leftover there once
-// per startup when its snapshot can be made, which is this function's
-// counterpart for the tree no-mistakes owns outright.
+// directory, and startup cleanup attempts its recorded leftovers once per
+// startup under the same preservation rule.
 func reapWorktrees(d *db.DB, p *paths.Paths, policy worktreeReapPolicy, now time.Time) {
 	removable, _ := defaultTreeOrphanWorktrees(d, p)
 	if len(removable) == 0 {
@@ -104,10 +96,10 @@ func reapWorktrees(d *db.DB, p *paths.Paths, policy worktreeReapPolicy, now time
 }
 
 // worktreeReapCandidates applies policy to removable, oldest first, and
-// returns exactly the directories it selects for removal: an eligible
-// directory older than the retention window, plus whatever survives that cut
-// trimmed to the run ceiling. It is the single source of the removal
-// decision, shared by reapWorktrees and by the startup process sweep (see
+// returns exactly the directories it selects for attempted cleanup: eligible
+// directories older than the retention window, plus whatever survives that
+// cut trimmed to the run ceiling. It is the single source of candidate
+// selection, shared by reapWorktrees and by the startup process sweep (see
 // retainedDefaultTreeRunIDs in daemon.go), so a worktree the policy is
 // keeping is never treated as orphaned by one caller while the other retains
 // it.

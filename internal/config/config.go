@@ -148,19 +148,14 @@ const (
 	// of age, so a burst of parallel runs that all land inside the retention
 	// window still cannot grow the directory without bound.
 	DefaultEvidenceMaxRuns = 200
-	// DefaultWorktreeRetention bounds how long a terminal run's leftover
-	// worktree directory survives under the default <NM_HOME>/worktrees tree.
-	// A run's worktree is already removed the moment its pipeline finishes
-	// (see daemon.RunManager.removeRunWorktree); this budget only ever governs
-	// the leftover a failed removal - or a protected-path refusal that later
-	// became removable - left behind, so it is deliberately short: these
-	// directories are often full toolchain checkouts (node_modules and the
-	// like), not the small text artifacts test.evidence.retention bounds.
+	// DefaultWorktreeRetention selects terminal-run leftovers for attempted
+	// cleanup under the default <NM_HOME>/worktrees tree after this age.
+	// Real checkouts are retained even when clean or successfully snapshotted,
+	// because stability through removal is unproven. This is not a disk bound.
 	DefaultWorktreeRetention = 24 * time.Hour
-	// DefaultWorktreeMaxRuns caps how many leftover worktree directories
-	// survive regardless of age, for the same reason DefaultEvidenceMaxRuns
-	// does: a burst of failures inside the retention window must still not
-	// grow the directory without bound.
+	// DefaultWorktreeMaxRuns selects the oldest eligible leftovers for
+	// attempted cleanup when their count exceeds this value. Retained real
+	// checkouts can exceed it until a separate stability proof exists.
 	DefaultWorktreeMaxRuns = 20
 	// DefaultQuotaExpectedRunLength is the runway floor a projected
 	// exhaustion must clear for an agent to stay rankable: a subscription
@@ -1328,17 +1323,14 @@ type WorktreeRaw struct {
 	MaxRuns   *int    `yaml:"max_runs"`
 }
 
-// Worktree is the resolved local run-worktree retention config. A finished
-// run removes its worktree after a verified snapshot of unique uncommitted
-// work, or when the checkout is clean (see daemon.RunManager.removeRunWorktree);
-// this bounds what a failed removal, a protected-path refusal that later
-// became removable, or a checkout kept because that snapshot could not be
-// made leaves behind, on a long-lived daemon that may not restart for weeks
-// (see daemon.cleanupOrphanWorktrees for the crash-recovery counterpart,
-// which runs only at startup). A later reap leaves a checkout whose snapshot
-// cannot be made. Zero Retention disables age-based reaping and zero MaxRuns
-// disables the count ceiling, matching Evidence. The removal rule is owned
-// by docs/src/content/docs/concepts/daemon.md.
+// Worktree is the resolved local run-worktree cleanup policy. Age and count
+// settings select eligible leftovers for attempted cleanup, not guaranteed
+// reclamation. Finished-run and startup cleanup retain real checkouts even
+// when clean or successfully snapshotted, because stability through removal
+// is unproven. Disk use can exceed both budgets until a separate stability
+// proof exists. Zero Retention disables age-based selection and zero MaxRuns
+// disables count-based selection. The removal rule is owned by
+// docs/src/content/docs/concepts/daemon.md.
 type Worktree struct {
 	Retention time.Duration
 	MaxRuns   int
@@ -1709,16 +1701,14 @@ log_level: info
 # worktree_roots:
 #   /Users/you/src/my-repo: /Users/you/work/my-repo-runs
 
-# A finished run removes its worktree after a verified snapshot of unique
-# uncommitted work, or when the checkout is clean. This bounds what a rare
-# failed removal, a protected-path refusal that later became removable, or a
-# checkout kept because that snapshot could not be made leaves behind. A later
-# reap leaves the checkout in place while the snapshot cannot be made.
-# Retention ages leftover directories out (default 24 hours) and max_runs caps
-# how many survive regardless of age (default 20), the same way
-# test.evidence.retention bounds evidence. Set retention to "unlimited", or
-# either to 0, to disable that bound. Global-only, like test.evidence's
-# retention settings.
+# Age (default 24 hours) and count (default 20) select eligible leftover run
+# directories for attempted cleanup. Real checkouts are retained even when
+# clean or successfully snapshotted, because stability through removal is
+# unproven. These settings cannot ensure disk reclamation or bound the number
+# of retained checkouts until a separate stability proof exists.
+# Set retention to "unlimited" or 0 to disable age-based selection, and
+# max_runs to 0 to disable count-based selection. Global-only, like
+# test.evidence's retention settings.
 # worktree:
 #   retention: 24h
 #   max_runs: 20
