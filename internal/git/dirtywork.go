@@ -763,7 +763,8 @@ func secretPath(rel string) bool {
 	slashed := filepath.ToSlash(rel)
 	base := strings.ToLower(filepath.Base(slashed))
 	switch base {
-	case ".env", ".npmrc", ".git-credentials", "credentials", "credentials.json", "credentials.yml", "credentials.yaml",
+	case ".env", ".npmrc", ".git-credentials", ".netrc", "_netrc", ".pypirc",
+		"credentials", "credentials.json", "credentials.yml", "credentials.yaml",
 		"secrets.json", "secrets.yaml", "secrets.yml",
 		"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519":
 		return true
@@ -1128,6 +1129,9 @@ func writeDirtySnapshot(ctx context.Context, req DirtyWorkRequest, ref string, e
 		return nil, err
 	}
 	indexEnv := []string{"GIT_INDEX_FILE=" + indexCopy}
+	if err := scanIndexBlobs(ctx, wt, indexCopy); err != nil {
+		return nil, err
+	}
 	indexTree, err := RunWithEnv(ctx, wt, indexEnv, "write-tree")
 	if err != nil {
 		return nil, fmt.Errorf("write index tree: %w", err)
@@ -1138,9 +1142,6 @@ func writeDirtySnapshot(ctx context.Context, req DirtyWorkRequest, ref string, e
 	}
 	if liveTree != indexTree {
 		return nil, fmt.Errorf("index changed while capturing dirty work")
-	}
-	if err := scanIndexBlobs(ctx, wt, indexCopy); err != nil {
-		return nil, err
 	}
 	fileMode, err := checkoutFileMode(ctx, wt)
 	if err != nil {
