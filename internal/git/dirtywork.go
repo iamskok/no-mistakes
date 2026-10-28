@@ -104,7 +104,7 @@ func CaptureDirtyWork(ctx context.Context, req DirtyWorkRequest) (*DirtyWorkSnap
 		return nil, err
 	}
 	if len(entries) == 0 {
-		return nil, nil
+		return nil, assertCheckoutClean(ctx, wt, nil)
 	}
 	ref := DirtyWorkRef(req.RunID)
 	if _, err := Run(ctx, req.GateDir, "check-ref-format", ref); err != nil {
@@ -146,7 +146,7 @@ func DirtyWorkStillMatches(ctx context.Context, worktree string, snap *DirtyWork
 		return fmt.Errorf("stat checkout git dir: %w", err)
 	}
 	if snap == nil {
-		return assertCheckoutClean(ctx, worktree)
+		return assertCheckoutClean(ctx, worktree, nil)
 	}
 	head, indexTree, workTree, untrackedTree, err := readSnapshotTrees(ctx, worktree, snap.Commit)
 	if err != nil {
@@ -160,7 +160,7 @@ func DirtyWorkStillMatches(ctx context.Context, worktree string, snap *DirtyWork
 		return err
 	}
 	defer os.RemoveAll(tmp)
-	return recheckDirtyWork(ctx, worktree, tmp, head, indexTree, workTree, untrackedTree)
+	return recheckDirtyWork(ctx, worktree, tmp, head, indexTree, workTree, untrackedTree, nil)
 }
 
 // RestoreDirtyWork reapplies a snapshot onto a checkout already at the
@@ -258,12 +258,15 @@ func appendTrackedByteEdits(ctx context.Context, wt string, entries []dirtyEntry
 		seen[filepath.ToSlash(entries[i].rel)] = i
 	}
 	err = walkIndexBlobs(out, func(mode, rel, sha string) error {
-		differs, exists, err := trackedPathDiffers(ctx, wt, rel, mode, sha)
+		differs, exists, err := trackedPathDiffers(ctx, wt, rel, mode, sha, nil)
 		if err != nil {
 			return err
 		}
 		if !differs {
 			return nil
+		}
+		if mode == "160000" {
+			return fmt.Errorf("%w: dirty submodule %s cannot be snapshotted", ErrDirtyWorkRejected, rel)
 		}
 		slash := filepath.ToSlash(rel)
 		if i, ok := seen[slash]; ok {
@@ -292,7 +295,7 @@ func overlayHiddenWorktree(code string, exists bool) string {
 	return string([]byte{code[0], col})
 }
 
-func trackedPathDiffers(ctx context.Context, wt, rel, mode, sha string) (differs, exists bool, err error) {
+func trackedPathDiffers(ctx context.Context, wt, rel, mode, sha string, observed map[string]os.FileInfo) (differs, exists bool, err error) {
 	full := filepath.Join(wt, filepath.FromSlash(rel))
 	if err := assertPathOwned(canonicalPath(wt), full); err != nil {
 		return false, false, fmt.Errorf("%w: %s", ErrDirtyWorkRejected, err)
@@ -300,9 +303,45 @@ func trackedPathDiffers(ctx context.Context, wt, rel, mode, sha string) (differs
 	info, lerr := os.Lstat(full)
 	if lerr != nil {
 		if errors.Is(lerr, os.ErrNotExist) {
+			if mode == "160000" {
+				return false, false, nil
+			}
 			return true, false, nil
 		}
 		return false, false, lerr
+	}
+	if mode == "160000" {
+		if !info.IsDir() {
+			return true, true, nil
+		}
+		if _, err := os.Lstat(filepath.Join(full, ".git")); errors.Is(err, os.ErrNotExist) {
+			entries, err := os.ReadDir(full)
+			return len(entries) != 0, true, err
+		} else if err != nil {
+			return false, true, err
+		}
+		head, err := Run(ctx, full, "rev-parse", "--verify", "HEAD")
+		if err != nil {
+			return false, true, err
+		}
+		if head != sha {
+			return true, true, nil
+		}
+		if err := assertCheckoutClean(ctx, full, observed); err != nil {
+			return false, true, fmt.Errorf("%w: dirty submodule %s: %w", ErrDirtyWorkRejected, rel, err)
+		}
+		if observed != nil {
+			index, err := absoluteGitPath(ctx, full, "index")
+			if err != nil {
+				return false, true, err
+			}
+			info, err := os.Lstat(index)
+			if err != nil {
+				return false, true, err
+			}
+			observed[index] = info
+		}
+		return false, true, nil
 	}
 	workMode, workSHA, err := worktreeBlob(ctx, wt, full, info)
 	if err != nil {
@@ -347,8 +386,9 @@ var dirtyWorkLocks [dirtyWorkLockStripes]sync.Mutex
 // hook runs before the checkout mutex is taken. The ref hook runs after the
 // snapshot matches and before update-ref, while the cleanup lock is held.
 var (
-	dirtyWorkBeforeLock      func()
-	dirtyWorkBeforeRefUpdate func()
+	dirtyWorkBeforeLock        func()
+	dirtyWorkBeforeRefUpdate   func()
+	dirtyWorkAfterContentCheck func(string)
 )
 
 func dirtyWorkMu(worktree string) *sync.Mutex {
@@ -378,14 +418,6 @@ func WithDirtyWorkCheckout(worktree string, fn func() error) error {
 	mu.Lock()
 	defer mu.Unlock()
 	return fn()
-}
-
-func readDirtyEntries(ctx context.Context, wt string) ([]dirtyEntry, error) {
-	entries, err := checkoutDirtyEntries(ctx, wt)
-	if err != nil || len(entries) == 0 {
-		return nil, err
-	}
-	return loadDirtyEntries(ctx, wt, entries)
 }
 
 func loadDirtyEntries(ctx context.Context, wt string, entries []dirtyEntry) ([]dirtyEntry, error) {
@@ -801,9 +833,25 @@ func scanIndexBlobs(ctx context.Context, wt, indexFile string) error {
 	if err != nil {
 		return fmt.Errorf("read copied index: %w", err)
 	}
+	changed, err := runInDirWithEnvRaw(ctx, wt, env, "diff", "--cached", "--name-only", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", "HEAD")
+	if err != nil {
+		return fmt.Errorf("read newly captured index paths: %w", err)
+	}
+	newMaterial := make(map[string]bool)
+	for _, path := range bytes.Split(changed, []byte{0}) {
+		if len(path) != 0 {
+			newMaterial[filepath.FromSlash(string(path))] = true
+		}
+	}
 	return walkIndexBlobs(out, func(mode, path, sha string) error {
 		if secretPath(path) {
 			return fmt.Errorf("%w: %s is secret-bearing", ErrDirtyWorkRejected, path)
+		}
+		if !newMaterial[path] {
+			return nil
+		}
+		if mode == "160000" {
+			return fmt.Errorf("%w: changed submodule %s cannot be snapshotted", ErrDirtyWorkRejected, path)
 		}
 		found, err := gitStreamContainsSecret(ctx, wt, "cat-file", "blob", sha)
 		if err != nil {
@@ -872,20 +920,20 @@ func (s *secretStreamScanner) Write(p []byte) (int, error) {
 
 func gitStreamContainsSecret(ctx context.Context, dir string, args ...string) (bool, error) {
 	scan := &secretStreamScanner{ctx: ctx}
-	err := gitStreamTo(ctx, dir, scan, args...)
+	err := gitStreamTo(ctx, dir, nil, scan, args...)
 	if scan.found {
 		return true, nil
 	}
 	return false, err
 }
 
-func gitStreamTo(ctx context.Context, dir string, dst io.Writer, args ...string) error {
+func gitStreamTo(ctx context.Context, dir string, env []string, dst io.Writer, args ...string) error {
 	if isBareGitDir(dir) {
 		args = append([]string{"--git-dir=" + dir}, args...)
 	}
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
-	cmd.Env = nonInteractiveEnvForContext(ctx, dir)
+	cmd.Env = append(nonInteractiveEnvForContext(ctx, dir), env...)
 	cmd.Stdout = dst
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -993,7 +1041,7 @@ func writeDirtySnapshot(ctx context.Context, req DirtyWorkRequest, ref string, e
 	if _, err := Run(ctx, req.GateDir, "cat-file", "-t", commit); err != nil {
 		return nil, fmt.Errorf("snapshot is not in the gate repository: %w", err)
 	}
-	if err := recheckDirtyWork(ctx, wt, tmp, head, indexTree, workTree, untrackedTree); err != nil {
+	if err := recheckDirtyWork(ctx, wt, tmp, head, indexTree, workTree, untrackedTree, nil); err != nil {
 		return nil, err
 	}
 	if dirtyWorkBeforeRefUpdate != nil {
@@ -1148,7 +1196,7 @@ func hashPrepared(ctx context.Context, wt string, path preparedEntry) (string, e
 	return Run(ctx, wt, args...)
 }
 
-func recheckDirtyWork(ctx context.Context, wt, tmp, head, indexTree, workTree, untrackedTree string) error {
+func recheckDirtyWork(ctx context.Context, wt, tmp, head, indexTree, workTree, untrackedTree string, observed map[string]os.FileInfo) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -1172,13 +1220,6 @@ func recheckDirtyWork(ctx context.Context, wt, tmp, head, indexTree, workTree, u
 	if live != indexTree {
 		return fmt.Errorf("index changed while capturing dirty work")
 	}
-	return worktreeEqualsSnapshot(ctx, wt, tmp, workTree, untrackedTree)
-}
-
-func worktreeEqualsSnapshot(ctx context.Context, wt, tmp, workTree, untrackedTree string) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
 	index := filepath.Join(tmp, "equal-index")
 	if err := os.WriteFile(index, nil, 0o644); err != nil {
 		return err
@@ -1186,6 +1227,10 @@ func worktreeEqualsSnapshot(ctx context.Context, wt, tmp, workTree, untrackedTre
 	env := []string{"GIT_INDEX_FILE=" + index}
 	if _, err := RunWithEnv(ctx, wt, env, "read-tree", workTree); err != nil {
 		return fmt.Errorf("read tracked snapshot: %w", err)
+	}
+	trackedBlobs, err := runInDirWithEnvRaw(ctx, wt, env, "ls-files", "--stage", "-z")
+	if err != nil {
+		return err
 	}
 	if untrackedTree != "" {
 		info, err := untrackedIndexInfo(ctx, wt, untrackedTree)
@@ -1202,15 +1247,232 @@ func worktreeEqualsSnapshot(ctx context.Context, wt, tmp, workTree, untrackedTre
 	if err != nil {
 		return err
 	}
+	if observed == nil {
+		observed = make(map[string]os.FileInfo)
+	}
 	if err := walkIndexBlobs(blobs, func(mode, path, sha string) error {
-		if mode == "120000" {
+		full := filepath.Join(wt, path)
+		info, err := os.Lstat(full)
+		if err != nil && !(mode == "160000" && errors.Is(err, os.ErrNotExist)) {
+			return err
+		}
+		observed[full] = info
+		return nil
+	}); err != nil {
+		return err
+	}
+	for _, tree := range []string{head, indexTree} {
+		paths, err := RunRaw(ctx, wt, "ls-tree", "-r", "--name-only", "-z", tree)
+		if err != nil {
+			return err
+		}
+		for _, path := range bytes.Split(paths, []byte{0}) {
+			if len(path) == 0 {
+				continue
+			}
+			rel, err := cleanCheckoutRel(string(path))
+			if err != nil {
+				return err
+			}
+			full := filepath.Join(wt, rel)
+			if _, ok := observed[full]; !ok {
+				observed[full] = nil
+			}
+		}
+	}
+	preserveTracked := make(map[string]bool)
+	for _, tree := range []string{indexTree, workTree} {
+		changed, err := RunRaw(ctx, wt, "diff-tree", "-r", "--name-only", "-z", "--no-renames", head, tree)
+		if err != nil {
+			return err
+		}
+		for _, path := range bytes.Split(changed, []byte{0}) {
+			if len(path) != 0 {
+				preserveTracked[filepath.FromSlash(string(path))] = true
+			}
+		}
+	}
+	headTree, err := Run(ctx, wt, "rev-parse", "--verify", head+"^{tree}")
+	if err != nil {
+		return err
+	}
+	seenTrees := make(map[string]bool)
+	for _, tree := range []string{headTree, indexTree, workTree} {
+		if seenTrees[tree] {
+			continue
+		}
+		seenTrees[tree] = true
+		if err := verifyRestoreConversions(ctx, wt, tmp, tree, trackedBlobs, preserveTracked); err != nil {
+			return err
+		}
+	}
+	if untrackedTree != "" {
+		preserveAll := make(map[string]bool)
+		for path := range preserveTracked {
+			preserveAll[path] = true
+		}
+		paths, err := RunRaw(ctx, wt, "ls-tree", "-r", "--name-only", "-z", untrackedTree)
+		if err != nil {
+			return err
+		}
+		for _, path := range bytes.Split(paths, []byte{0}) {
+			if len(path) != 0 {
+				preserveAll[filepath.FromSlash(string(path))] = true
+			}
+		}
+		if err := verifyRestoreConversions(ctx, wt, tmp, workTree, blobs, preserveAll); err != nil {
+			return err
+		}
+		combined, err := RunWithEnv(ctx, wt, env, "write-tree")
+		if err != nil {
+			return err
+		}
+		if err := verifyRestoreConversions(ctx, wt, tmp, combined, blobs, preserveAll); err != nil {
+			return err
+		}
+	}
+	if err := walkIndexBlobs(blobs, func(mode, path, sha string) error {
+		differs, _, err := trackedPathDiffers(ctx, wt, path, mode, sha, observed)
+		if err != nil {
+			return err
+		}
+		if differs {
+			return fmt.Errorf("%w: snapshot bytes differ from %s", ErrDirtyWorkRejected, path)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	if dirtyWorkAfterContentCheck != nil {
+		dirtyWorkAfterContentCheck(wt)
+	}
+	if err := rejectNonSnapshotable(ctx, wt); err != nil {
+		return err
+	}
+	out, err := runInDirWithEnvAndInputRaw(ctx, wt, env, "", gitStatusArgs()...)
+	if err != nil {
+		return err
+	}
+	if err := statusMatchesSnapshot(out); err != nil {
+		return err
+	}
+	others, err := runInDirWithEnvRaw(ctx, wt, env, "ls-files", "--others", "--exclude-standard", "-z")
+	if err != nil {
+		return err
+	}
+	if len(others) != 0 {
+		return fmt.Errorf("%w: checkout file membership changed", ErrDirtyWorkRejected)
+	}
+	if err := rejectIndexIntent(ctx, wt, nil); err != nil {
+		return err
+	}
+	live, err = Run(ctx, wt, "write-tree")
+	if err != nil {
+		return err
+	}
+	if live != indexTree {
+		return fmt.Errorf("%w: index changed after content verification", ErrDirtyWorkRejected)
+	}
+	current, err = Run(ctx, wt, "rev-parse", "--verify", "HEAD")
+	if err != nil {
+		return err
+	}
+	if current != head {
+		return fmt.Errorf("%w: HEAD changed after content verification", ErrDirtyWorkRejected)
+	}
+	for path, before := range observed {
+		after, err := os.Lstat(path)
+		if before == nil && errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil || before == nil || !os.SameFile(before, after) || before.Mode() != after.Mode() || before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
+			return fmt.Errorf("%w: observed path changed: %s", ErrDirtyWorkRejected, path)
+		}
+	}
+	return ctx.Err()
+}
+
+func verifyRestoreConversions(ctx context.Context, wt, tmp, tree string, blobs []byte, paths map[string]bool) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	root, err := os.MkdirTemp(tmp, "restore-attributes-")
+	if err != nil {
+		return err
+	}
+	gitDir, err := Run(ctx, wt, "rev-parse", "--absolute-git-dir")
+	if err != nil {
+		return err
+	}
+	env := []string{"GIT_DIR=" + gitDir, "GIT_INDEX_FILE=" + filepath.Join(tmp, "restore-index"), "GIT_WORK_TREE=" + root}
+	if _, err := RunWithEnv(ctx, root, env, "read-tree", tree); err != nil {
+		return err
+	}
+	attributeFile, err := RunWithEnv(ctx, root, env, "config", "--path", "--default", "", "--get", "core.attributesfile")
+	if err != nil {
+		return err
+	}
+	if attributeFile != "" {
+		return fmt.Errorf("%w: a custom attributes file prevents restore verification", ErrDirtyWorkRejected)
+	}
+	stageBlobs, err := runInDirWithEnvRaw(ctx, root, env, "ls-files", "--stage", "-z")
+	if err != nil {
+		return err
+	}
+	protected := make(map[string]bool)
+	for path := range paths {
+		protected[path] = true
+	}
+	if err := walkIndexBlobs(stageBlobs, func(mode, path, sha string) error {
+		if filepath.Base(path) != ".gitattributes" || (mode != "100644" && mode != "100755") {
+			return nil
+		}
+		protected[path] = true
+		full := filepath.Join(root, path)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			return err
+		}
+		file, err := os.Create(full)
+		if err != nil {
+			return err
+		}
+		err = gitStreamTo(ctx, root, env, file, "cat-file", "blob", sha)
+		closeErr := file.Close()
+		if err != nil {
+			return err
+		}
+		return closeErr
+	}); err != nil {
+		return err
+	}
+	var input strings.Builder
+	for path := range protected {
+		input.WriteString(filepath.ToSlash(path))
+		input.WriteByte(0)
+	}
+	attrs, err := runInDirWithEnvAndInputRaw(ctx, root, env, input.String(), "check-attr", "--cached", "-z", "--stdin", "filter")
+	if err != nil {
+		return err
+	}
+	fields := bytes.Split(bytes.TrimSuffix(attrs, []byte{0}), []byte{0})
+	if len(fields)%3 != 0 {
+		return fmt.Errorf("%w: unreadable restore attributes", ErrDirtyWorkRejected)
+	}
+	for i := 0; i < len(fields); i += 3 {
+		value := string(fields[i+2])
+		if value != "unspecified" && value != "unset" {
+			return fmt.Errorf("%w: external conversion for %s cannot be verified", ErrDirtyWorkRejected, fields[i])
+		}
+	}
+	check := func(mode, path, sha string) error {
+		if mode == "120000" || mode == "160000" {
 			return nil
 		}
 		restored, err := os.CreateTemp(tmp, "restored-")
 		if err != nil {
 			return err
 		}
-		err = gitStreamTo(ctx, wt, restored, "cat-file", "--filters", "--path="+filepath.ToSlash(path), sha)
+		err = gitStreamTo(ctx, root, env, restored, "cat-file", "--filters", "--path="+filepath.ToSlash(path), sha)
 		closeErr := restored.Close()
 		if err != nil {
 			return err
@@ -1226,25 +1488,20 @@ func worktreeEqualsSnapshot(ctx context.Context, wt, tmp, workTree, untrackedTre
 			return fmt.Errorf("%w: Git conversion changes restored bytes for %s", ErrDirtyWorkRejected, path)
 		}
 		return nil
+	}
+	if err := walkIndexBlobs(stageBlobs, func(mode, path, sha string) error {
+		if filepath.Base(path) == ".gitattributes" {
+			return check(mode, path, sha)
+		}
+		return nil
 	}); err != nil {
 		return err
 	}
-	out, err := runInDirWithEnvAndInputRaw(ctx, wt, env, "", gitStatusArgs()...)
-	if err != nil {
-		return err
-	}
-	if err := statusMatchesSnapshot(out); err != nil {
-		return err
-	}
 	return walkIndexBlobs(blobs, func(mode, path, sha string) error {
-		differs, _, err := trackedPathDiffers(ctx, wt, path, mode, sha)
-		if err != nil {
-			return err
+		if !paths[path] {
+			return nil
 		}
-		if differs {
-			return fmt.Errorf("%w: snapshot bytes differ from %s", ErrDirtyWorkRejected, path)
-		}
-		return nil
+		return check(mode, path, sha)
 	})
 }
 
@@ -1419,18 +1676,21 @@ func ignoredPathSet(ctx context.Context, wt string, paths []string) (map[string]
 	return ignored, nil
 }
 
-func assertCheckoutClean(ctx context.Context, wt string) error {
-	if err := rejectNonSnapshotable(ctx, wt); err != nil {
-		return err
-	}
-	entries, err := readDirtyEntries(ctx, wt)
+func assertCheckoutClean(ctx context.Context, wt string, observed map[string]os.FileInfo) error {
+	head, err := Run(ctx, wt, "rev-parse", "--verify", "HEAD")
 	if err != nil {
 		return err
 	}
-	if len(entries) != 0 {
-		return fmt.Errorf("checkout changed after the dirty work snapshot")
+	tree, err := Run(ctx, wt, "rev-parse", "--verify", head+"^{tree}")
+	if err != nil {
+		return err
 	}
-	return nil
+	tmp, err := os.MkdirTemp("", "nm-dirty-work-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmp)
+	return recheckDirtyWork(ctx, wt, tmp, head, tree, tree, "", observed)
 }
 
 func readSnapshotTrees(ctx context.Context, wt, commit string) (head, indexTree, workTree, untrackedTree string, err error) {
