@@ -79,6 +79,15 @@ func TestFinishedCleanupReleasesSlotBeforeSlowMaintenance(t *testing.T) {
 				slow := orphanWorktree{gateDir: f.gate, dir: f.p.WorktreeDir(repo.ID, firstID), repoID: repo.ID, runID: firstID}
 				if history {
 					slow = f.checkout(t, false)
+					// Refuse immediate capture at the index-intent check, so the
+					// historical filter is reached within the shared budget even
+					// on Windows. Verifying the clean first checkout can otherwise
+					// consume that budget before this test's slow phase starts.
+					own := f.p.WorktreeDir(repo.ID, firstID)
+					if err := os.WriteFile(filepath.Join(own, "pending.txt"), []byte("retain index intent\n"), 0o644); err != nil {
+						t.Fatal(err)
+					}
+					gitCmd(t, own, "add", "--intent-to-add", "pending.txt")
 				} else if err := os.WriteFile(filepath.Join(slow.dir, ".gitattributes"), []byte("test.txt filter=slow\n"), 0o644); err != nil {
 					t.Fatal(err)
 				}
