@@ -1562,8 +1562,10 @@ func newAxiRespondCmd() *cobra.Command {
 			"snapshotted in the gate at refs/no-mistakes/dirty/<run-id> before the worktree\n" +
 			"is removed, and the worktree is kept if that snapshot cannot be verified.\n" +
 			"Ignored files are not part of that snapshot and are removed with the worktree.\n" +
-			"Restore it by checking out the snapshot's first parent and running\n" +
-			"git -c core.symlinks=true stash apply --index <snapshot>. Return branch custody through\n" +
+			"Read restore-core-autocrlf and restore-core-eol from the snapshot message.\n" +
+			"Use those values for both creating a worktree at the first parent and running\n" +
+			"git -c core.symlinks=true -c core.autocrlf=<saved> -c core.eol=<saved> stash apply --index <snapshot>.\n" +
+			"Return branch custody through\n" +
 			"the structured branch_sync next_action in the output. Unlike `axi abort`,\n" +
 			"which cancels whatever the run is doing, this records a rejection at one\n" +
 			"gate and is refused unless the run is parked there.\n\n" +

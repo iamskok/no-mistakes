@@ -46,7 +46,7 @@ func TestDirtyWorkStillMatchesRejectsRecreatedIgnoredTrackedDeletion(t *testing.
 
 func TestDirtyWorkRecheckRejectsLateChanges(t *testing.T) {
 	for _, phase := range []string{"publish", "remove", "clean"} {
-		for _, change := range []string{"untracked", "index", "head", "intent", "tracked"} {
+		for _, change := range []string{"untracked", "index", "head", "intent", "tracked", "config"} {
 			t.Run(phase+"/"+change, func(t *testing.T) {
 				ctx := context.Background()
 				gate, wt, _, _ := newDirtyWorkGate(t, "late-change")
@@ -85,6 +85,8 @@ func TestDirtyWorkRecheckRejectsLateChanges(t *testing.T) {
 						run(t, wt, "git", "add", "-N", "-f", "--", "intent.late")
 					case "tracked":
 						writeFile(t, filepath.Join(wt, "gone.txt"), "late tracked bytes\n")
+					case "config":
+						run(t, wt, "git", "config", "core.autocrlf", "input")
 					}
 				}
 				if phase == "publish" {
@@ -115,6 +117,13 @@ func TestDirtyWorkStillMatchesRejectsLateBytesHiddenByIdent(t *testing.T) {
 	writeFile(t, filepath.Join(wt, "file.txt"), "binary\x00$Id$\n")
 	run(t, wt, "git", "add", ".gitattributes", "file.txt")
 	run(t, wt, "git", "commit", "-m", "unchanged ident file")
+	clean, err := RunRaw(ctx, wt, "cat-file", "--filters", "--path=file.txt", "HEAD:file.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, "file.txt"), clean, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	writeFile(t, filepath.Join(wt, "gone.txt"), "unique work\n")
 	snap, err := CaptureDirtyWork(ctx, DirtyWorkRequest{GateDir: gate, Worktree: wt, RunID: dirtyWorkRunID})
 	if err != nil || snap == nil {
