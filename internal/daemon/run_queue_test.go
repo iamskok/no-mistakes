@@ -750,8 +750,8 @@ func TestMaxConcurrentRuns_CancelRecoveredRunPreservesUnpublishedHead(t *testing
 			if terminal.TerminalHeadVerifiedAt == nil || terminal.HeadSHA != fixed {
 				t.Fatalf("terminal head = %s, verified = %v, want verified %s", terminal.HeadSHA, terminal.TerminalHeadVerifiedAt, fixed)
 			}
-			if _, err := os.Stat(workDir); !os.IsNotExist(err) {
-				t.Fatalf("cancelled worktree was not removed: %v", err)
+			if _, err := os.Stat(workDir); err != nil {
+				t.Fatalf("cancelled checkout was removed without a stability proof: %v", err)
 			}
 			if got := gitOutput(t, gateDir, "rev-parse", custody.RecoveryRef(run.ID)); got != fixed {
 				t.Fatalf("recovery anchor = %s, want %s", got, fixed)

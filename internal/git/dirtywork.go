@@ -1354,6 +1354,13 @@ func recheckDirtyWork(ctx context.Context, wt, tmp, head, indexTree, workTree, u
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	attributeFile, err := Run(ctx, wt, "config", "--path", "--default", "", "--get", "core.attributesfile")
+	if err != nil {
+		return err
+	}
+	if attributeFile != "" {
+		return fmt.Errorf("%w: a custom attributes file prevents restore verification", ErrDirtyWorkRejected)
+	}
 	if err := rejectIndexIntent(ctx, wt, nil); err != nil {
 		return err
 	}
@@ -1607,13 +1614,6 @@ func verifyRestoreConversions(ctx context.Context, wt, tmp, tree string, blobs [
 	env := []string{"GIT_DIR=" + gitDir, "GIT_INDEX_FILE=" + filepath.Join(tmp, "restore-index"), "GIT_WORK_TREE=" + root}
 	if _, err := RunWithEnv(ctx, root, env, "read-tree", tree); err != nil {
 		return err
-	}
-	attributeFile, err := RunWithEnv(ctx, root, env, "config", "--path", "--default", "", "--get", "core.attributesfile")
-	if err != nil {
-		return err
-	}
-	if attributeFile != "" {
-		return fmt.Errorf("%w: a custom attributes file prevents restore verification", ErrDirtyWorkRejected)
 	}
 	stageBlobs, err := runInDirWithEnvRaw(ctx, root, env, "ls-files", "--stage", "-z")
 	if err != nil {

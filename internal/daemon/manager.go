@@ -749,7 +749,7 @@ func (m *RunManager) cleanupRunEvidence(cfg *config.Config, runID string) {
 // removal. A failed or cancelled capture keeps the directory, including when
 // the snapshot is refused because a path is secret-bearing, not a regular
 // file, or outside the checkout, or because the checkout changed after the
-// snapshot was recorded. A clean checkout is removed as before.
+// snapshot was recorded.
 func (m *RunManager) removeRunWorktree(repoID, runID, gateDir, wtDir, reason string) {
 	m.sweepRunWorktreeProcesses(repoID, runID, wtDir)
 	run, err := m.db.GetRun(runID)
@@ -778,7 +778,7 @@ func (m *RunManager) removeRunWorktree(repoID, runID, gateDir, wtDir, reason str
 			return err
 		}
 		if err := confirmDirtyWorkBeforeRemoval(wtDir, snap); err != nil {
-			slog.Warn("preserving run worktree: checkout changed after the dirty work snapshot", "run_id", runID, "path", wtDir, "reason", reason, "error", err)
+			slog.Warn("preserving run worktree: cleanup verification refused", "run_id", runID, "path", wtDir, "reason", reason, "error", err)
 			return err
 		}
 		if err := git.WorktreeRemove(context.Background(), gateDir, wtDir); err != nil {

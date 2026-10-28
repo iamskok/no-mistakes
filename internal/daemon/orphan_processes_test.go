@@ -475,8 +475,8 @@ func TestRemoveRunWorktreeSweepsBeforeRemoving(t *testing.T) {
 	if !processIsAlive(operatorPID) {
 		t.Errorf("removal signalled %d in the operator's own directory", operatorPID)
 	}
-	if _, err := os.Stat(wtDir); !os.IsNotExist(err) {
-		t.Errorf("worktree directory survived removal, stat err: %v", err)
+	if _, err := os.Stat(wtDir); err != nil {
+		t.Errorf("unproven checkout was removed after sweeping, stat err: %v", err)
 	}
 }
 

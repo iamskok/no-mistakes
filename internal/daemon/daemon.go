@@ -972,7 +972,15 @@ func captureDirtyWorkBeforeRemoval(gateDir, wtDir, runID, baseSHA string) (*git.
 func confirmDirtyWorkBeforeRemoval(wtDir string, snap *git.DirtyWorkSnapshot) error {
 	ctx, cancel := context.WithTimeout(context.Background(), dirtyWorkCaptureTimeout)
 	defer cancel()
-	return git.DirtyWorkStillMatches(ctx, wtDir, snap)
+	if err := git.DirtyWorkStillMatches(ctx, wtDir, snap); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(filepath.Join(wtDir, ".git")); err == nil {
+		return errors.New("checkout retained because stability through removal cannot be proven without writer coordination")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // removeOrphanWorktree removes one run worktree directory its caller has
@@ -993,7 +1001,7 @@ func removeOrphanWorktree(ctx context.Context, wt orphanWorktree) bool {
 			return err
 		}
 		if err := confirmDirtyWorkBeforeRemoval(wtPath, snap); err != nil {
-			slog.Warn("preserving orphan worktree: checkout changed after the dirty work snapshot", "path", wtPath, "run_id", wt.runID, "error", err)
+			slog.Warn("preserving orphan worktree: cleanup verification refused", "path", wtPath, "run_id", wt.runID, "error", err)
 			return err
 		}
 		if err := git.WorktreeRemove(ctx, gateDir, wtPath); err != nil {

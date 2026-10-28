@@ -106,16 +106,8 @@ func TestProtectedPathRefusalCancellationCleanup(t *testing.T) {
 				assertProtectedWorktreePreserved(t, workDir, head)
 				return
 			}
-			deadline = time.Now().Add(15 * time.Second)
-			for {
-				if _, err := os.Stat(workDir); os.IsNotExist(err) {
-					return
-				}
-				if time.Now().After(deadline) {
-					t.Fatal("explicit operator abort no longer cleans its worktree")
-				}
-				time.Sleep(10 * time.Millisecond)
-			}
+			NewRunManager(database, p, nil).removeRunWorktree(repo.ID, result.RunID, p.RepoDir(repo.ID), workDir, "retention after abort")
+			assertProtectedWorktreePreserved(t, workDir, head)
 		})
 	}
 }
@@ -415,15 +407,12 @@ func TestProtectedPathPushApprovalCannotSkipPublicationOrDiscardEdits(t *testing
 		t.Fatalf("published head = %s, want %s", got, headSHA)
 	}
 	t.Logf("after explicit resolution + respond fix: run=%s last_pushed_sha=%s bare-remote feature=%s", run.Status, *run.LastPushedSHA, gitOutput(t, publicationDir, "rev-parse", "refs/heads/feature"))
-	deadline = time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(workDir); os.IsNotExist(err) {
-			t.Logf("after successful publication: worktree stat=%v", err)
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
+	if err := confirmDirtyWorkBeforeRemoval(workDir, nil); err == nil {
+		t.Fatal("successful publication authorized cleanup without a stability proof")
 	}
-	t.Fatal("clean worktree was not removed after successful publication")
+	if _, err := os.Stat(workDir); err != nil {
+		t.Fatalf("successful publication removed an unproven checkout: %v", err)
+	}
 }
 
 type protectedPathCommitStep struct {
