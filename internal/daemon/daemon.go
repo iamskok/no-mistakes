@@ -983,9 +983,10 @@ func removableOrphanWorktree(ctx context.Context, d *db.DB, wt *orphanWorktree) 
 	return ctx.Err() == nil
 }
 
-// dirtyWorkCaptureTimeout bounds the snapshot taken before a checkout is
-// removed. Finished-run cleanup uses a context independent of the cancelled
-// run. A snapshot that does not finish keeps the checkout.
+// dirtyWorkCaptureTimeout caps each capture or confirmation, subject to the
+// caller's earlier deadline. Startup passes its shared sweep context;
+// finished-run cleanup uses a context independent of the cancelled run.
+// An unfinished operation keeps the checkout.
 const dirtyWorkCaptureTimeout = 5 * time.Minute
 
 // captureDirtyWorkBeforeRemoval records unique uncommitted work in the gate
@@ -1002,9 +1003,10 @@ func captureDirtyWorkBeforeRemoval(ctx context.Context, gateDir, wtDir, runID, b
 	})
 }
 
-// confirmDirtyWorkBeforeRemoval rechecks the snapshot against the checkout
-// immediately before removal. A nil snapshot matches only a checkout that is
-// still clean.
+// confirmDirtyWorkBeforeRemoval rechecks the snapshot, then refuses every
+// real checkout: a point-in-time match cannot prove stability through removal
+// without writer coordination. Only a missing path or non-checkout directory
+// may pass; a nil snapshot alone never authorizes checkout removal.
 func confirmDirtyWorkBeforeRemoval(ctx context.Context, wtDir string, snap *git.DirtyWorkSnapshot) error {
 	ctx, cancel := context.WithTimeout(ctx, dirtyWorkCaptureTimeout)
 	defer cancel()
@@ -1019,13 +1021,14 @@ func confirmDirtyWorkBeforeRemoval(ctx context.Context, wtDir string, snap *git.
 	return nil
 }
 
-// removeOrphanWorktree removes one run worktree directory its caller has
-// already decided on and swept (see cleanupOrphanWorktrees). It reports
+// removeOrphanWorktree attempts cleanup of one run worktree directory its
+// caller has selected and swept (see cleanupOrphanWorktrees). It reports
 // whether the directory was actually removed, since git worktree remove and
 // its os.RemoveAll fallback can both fail and merely log a warning.
 //
-// os.RemoveAll runs only after unique uncommitted work has been snapshotted.
-// A capture failure returns false with the directory left in place.
+// Capture failure or confirmDirtyWorkBeforeRemoval's preservation refusal
+// returns false without removal. Only non-checkout leftovers can currently
+// reach git worktree remove or its os.RemoveAll fallback.
 func removeOrphanWorktree(ctx context.Context, wt orphanWorktree) bool {
 	if ctx.Err() != nil {
 		return false

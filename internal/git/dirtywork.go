@@ -27,8 +27,8 @@ import (
 // index, unstaged edits, or untracked files.
 const DirtyWorkRefPrefix = "refs/no-mistakes/dirty/"
 
-// ErrDirtyWorkRejected means the checkout has unique uncommitted work that
-// must not be copied into the snapshot. Callers keep the checkout.
+// ErrDirtyWorkRejected means capture or verification was refused, including
+// when a clean checkout's restoration cannot be verified. Callers keep it.
 var ErrDirtyWorkRejected = errors.New("rejected dirty work capture")
 
 // DirtyWorkRequest names the checkout to snapshot and the repository that
@@ -122,10 +122,10 @@ func CaptureDirtyWork(ctx context.Context, req DirtyWorkRequest) (*DirtyWorkSnap
 	return snap, nil
 }
 
-// DirtyWorkStillMatches reports whether worktree still has exactly the
-// uncommitted work snap recorded. A nil snapshot matches only a clean
-// checkout, or a directory that is not a checkout. Callers invoke it
-// immediately before deleting the checkout; any error means it must stay.
+// DirtyWorkStillMatches compares the checkout with snap at verification time.
+// A nil snapshot matches only a clean checkout, a missing path, or a directory
+// that is not a checkout. Any error requires retention; success alone cannot
+// prove stability through deletion in the presence of independent writers.
 func DirtyWorkStillMatches(ctx context.Context, worktree string, snap *DirtyWorkSnapshot) error {
 	if err := ctx.Err(); err != nil {
 		return err

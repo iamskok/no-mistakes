@@ -739,17 +739,15 @@ func (m *RunManager) cleanupRunEvidence(cfg *config.Config, runID string) {
 // removeRunWorktree sweeps processes before deciding whether to remove the
 // directory, so refusal retention cannot keep escaped workers alive.
 //
-// Every removal of a run worktree this package performs goes through here, and
-// none calls git.WorktreeRemove directly, because the ordering is easy to forget
+// Run-lifecycle cleanup routes go through here rather than calling
+// git.WorktreeRemove directly, because the ordering is easy to forget
 // at one site and invisible when forgotten - a run whose setup failed, whose
 // execution returned, or which was resumed after a crash all reach this point by
 // different routes. reason distinguishes the routes in the log.
 //
-// A checkout with unique uncommitted work is snapshotted into the gate before
-// removal. A failed or cancelled capture keeps the directory, including when
-// the snapshot is refused because a path is secret-bearing, not a regular
-// file, or outside the checkout, or because the checkout changed after the
-// snapshot was recorded.
+// Capture is attempted before confirmDirtyWorkBeforeRemoval applies the
+// preservation policy. Both a failed capture and that confirmation's refusal
+// keep the directory; a verified snapshot does not authorize its removal.
 func (m *RunManager) removeRunWorktree(repoID, runID, gateDir, wtDir, reason string) {
 	m.sweepRunWorktreeProcesses(repoID, runID, wtDir)
 	run, err := m.db.GetRun(runID)
