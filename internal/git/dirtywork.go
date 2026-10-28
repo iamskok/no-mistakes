@@ -431,7 +431,7 @@ type dirtyWorkConfig struct {
 }
 
 func (c dirtyWorkConfig) args(args ...string) []string {
-	return append([]string{"-c", "core.autocrlf=" + c.autoCRLF, "-c", "core.eol=" + c.eol}, args...)
+	return append([]string{"-c", "core.autocrlf=" + c.autoCRLF, "-c", "core.eol=" + c.eol, "-c", "apply.whitespace=nowarn"}, args...)
 }
 
 func checkoutFileMode(ctx context.Context, wt string) (bool, error) {
@@ -513,6 +513,7 @@ var (
 	dirtyWorkBeforeLock        func()
 	dirtyWorkBeforeRefUpdate   func()
 	dirtyWorkAfterContentCheck func(string)
+	dirtyWorkAfterBookkeeping  func(string)
 )
 
 func dirtyWorkMu(worktree string) *sync.Mutex {
@@ -1466,10 +1467,17 @@ func recheckDirtyWork(ctx context.Context, wt, tmp, head, indexTree, workTree, u
 			}
 		}
 	}
+	ignoredAttributes, err := RunRaw(ctx, wt, "ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--", ".gitattributes", ":(glob)**/.gitattributes")
+	if err != nil {
+		return err
+	}
+	attributesChanged := len(ignoredAttributes) != 0
 	for path := range preserveAll {
-		if filepath.Base(path) != ".gitattributes" {
-			continue
+		if filepath.Base(path) == ".gitattributes" {
+			attributesChanged = true
 		}
+	}
+	if attributesChanged {
 		if err := walkIndexBlobs(trackedBlobs, func(mode, path, sha string) error {
 			preserveTracked[path] = true
 			return nil
@@ -1482,7 +1490,6 @@ func recheckDirtyWork(ctx context.Context, wt, tmp, head, indexTree, workTree, u
 		}); err != nil {
 			return err
 		}
-		break
 	}
 	headTree, err := Run(ctx, wt, "rev-parse", "--verify", head+"^{tree}")
 	if err != nil {
@@ -1546,13 +1553,6 @@ func recheckDirtyWork(ctx context.Context, wt, tmp, head, indexTree, workTree, u
 	if activeConfig != config || activeFileMode != fileMode {
 		return fmt.Errorf("%w: checkout configuration changed during verification", ErrDirtyWorkRejected)
 	}
-	others, err := runInDirWithEnvRaw(ctx, wt, env, "ls-files", "--others", "--exclude-standard", "-z")
-	if err != nil {
-		return err
-	}
-	if len(others) != 0 {
-		return fmt.Errorf("%w: checkout file membership changed", ErrDirtyWorkRejected)
-	}
 	if err := rejectIndexIntent(ctx, wt, nil); err != nil {
 		return err
 	}
@@ -1570,6 +1570,9 @@ func recheckDirtyWork(ctx context.Context, wt, tmp, head, indexTree, workTree, u
 	if current != head {
 		return fmt.Errorf("%w: HEAD changed after content verification", ErrDirtyWorkRejected)
 	}
+	if dirtyWorkAfterBookkeeping != nil {
+		dirtyWorkAfterBookkeeping(wt)
+	}
 	for path, before := range observed {
 		after, err := os.Lstat(path)
 		if before == nil && errors.Is(err, os.ErrNotExist) {
@@ -1578,6 +1581,13 @@ func recheckDirtyWork(ctx context.Context, wt, tmp, head, indexTree, workTree, u
 		if err != nil || before == nil || !os.SameFile(before, after) || before.Mode() != after.Mode() || before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
 			return fmt.Errorf("%w: observed path changed: %s", ErrDirtyWorkRejected, path)
 		}
+	}
+	others, err := runInDirWithEnvRaw(ctx, wt, env, "ls-files", "--others", "--exclude-standard", "-z")
+	if err != nil {
+		return err
+	}
+	if len(others) != 0 {
+		return fmt.Errorf("%w: checkout file membership changed", ErrDirtyWorkRejected)
 	}
 	return ctx.Err()
 }

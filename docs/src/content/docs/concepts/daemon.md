@@ -100,8 +100,10 @@ For restoration, read `restore-core-autocrlf` and `restore-core-eol` from `git s
 
 ```sh
 git -c core.symlinks=true -c core.autocrlf=<restore-core-autocrlf> -c core.eol=<restore-core-eol> worktree add --detach <path> <snapshot-commit>^1
-git -C <path> -c core.symlinks=true -c core.autocrlf=<restore-core-autocrlf> -c core.eol=<restore-core-eol> stash apply --index <snapshot-commit>
+git -C <path> -c core.symlinks=true -c core.autocrlf=<restore-core-autocrlf> -c core.eol=<restore-core-eol> -c apply.whitespace=nowarn stash apply --index <snapshot-commit>
 ```
+
+The whitespace override keeps Git from rewriting staged bytes under an `apply.whitespace` setting such as `fix`.
 
 Event delivery is bounded, so a slow or wedged client can never stall a run. Under pressure the daemon may drop ordinary log output, but it never silently loses a state change: it coalesces those into a single gap signal, and the TUI and `axi` respond by re-reading authoritative run state. A live view can therefore skip log lines while it is behind, but it converges on the run's real state. After a dropped connection, the TUI retries with a bounded delay and reconciles when it reattaches; if the daemon remains unavailable, it surfaces the connection error instead of retrying forever.
 

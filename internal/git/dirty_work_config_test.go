@@ -227,7 +227,7 @@ func TestCaptureDirtyWork_RestoresAfterWorktreeConfigIsRemoved(t *testing.T) {
 			manual := filepath.Join(t.TempDir(), "documented restore")
 			run(t, gate, "git", "-c", "core.symlinks=true", "-c", "core.autocrlf=false", "-c", "core.eol=lf", "worktree", "add", "--detach", manual, head)
 			t.Cleanup(func() { _ = WorktreeRemove(ctx, gate, manual) })
-			run(t, manual, "git", "-c", "core.symlinks=true", "-c", "core.autocrlf=false", "-c", "core.eol=lf", "stash", "apply", "--index", snap.Commit)
+			run(t, manual, "git", "-c", "core.symlinks=true", "-c", "core.autocrlf=false", "-c", "core.eol=lf", "-c", "apply.whitespace=nowarn", "stash", "apply", "--index", snap.Commit)
 			if got := string(mustRead(t, filepath.Join(manual, "file.txt"))); got != "unique\n" {
 				t.Fatalf("documented procedure restored changed bytes: %q", got)
 			}
