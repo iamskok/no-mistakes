@@ -757,30 +757,30 @@ func (m *RunManager) cleanupRunEvidence(ctx context.Context, cfg *config.Config,
 func (m *RunManager) removeRunWorktree(ctx context.Context, repoID, runID, gateDir, wtDir, reason string) {
 	ctx, cancel := context.WithTimeout(ctx, finishedRunCleanupTimeout)
 	defer cancel()
-	m.sweepRunWorktreeProcesses(ctx, repoID, runID, wtDir)
-	if ctx.Err() != nil {
-		return
-	}
-	run, err := m.db.GetRun(runID)
-	if err != nil {
-		slog.Warn("preserving run worktree: cannot read run", "run_id", runID, "error", err)
-		return
-	}
-	if refusal := protectedPathCleanupReason(m.db, run); refusal != "" {
-		slog.Warn("preserving run worktree", "run_id", runID, "path", wtDir, "reason", refusal)
-		return
-	}
-	baseSHA := ""
-	if run != nil {
-		baseSHA = run.BaseSHA
-		if run.ID != "" {
-			runID = run.ID
+	_ = git.WithDirtyWorkCheckouts(ctx, []string{wtDir}, func() error {
+		m.sweepRunWorktreeProcesses(ctx, repoID, runID, wtDir)
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
-	}
-	// The lock covers capture through removal. Releasing it before deletion
-	// lets a second pass snapshot a newer edit, delete the checkout, and
-	// then lose that snapshot when this pass publishes the older ref.
-	_ = git.WithDirtyWorkCheckout(ctx, wtDir, func() error {
+		run, err := m.db.GetRun(runID)
+		if err != nil {
+			slog.Warn("preserving run worktree: cannot read run", "run_id", runID, "error", err)
+			return err
+		}
+		if refusal := protectedPathCleanupReason(m.db, run); refusal != "" {
+			slog.Warn("preserving run worktree", "run_id", runID, "path", wtDir, "reason", refusal)
+			return fmt.Errorf("cleanup refused: %s", refusal)
+		}
+		baseSHA := ""
+		if run != nil {
+			baseSHA = run.BaseSHA
+			if run.ID != "" {
+				runID = run.ID
+			}
+		}
+		// The lock covers capture through removal. Releasing it before deletion
+		// lets a second pass snapshot a newer edit, delete the checkout, and
+		// then lose that snapshot when this pass publishes the older ref.
 		snap, err := captureDirtyWorkBeforeRemoval(ctx, gateDir, wtDir, runID, baseSHA)
 		if err != nil {
 			slog.Warn("preserving run worktree: unique uncommitted work was not captured", "run_id", runID, "path", wtDir, "reason", reason, "error", err)

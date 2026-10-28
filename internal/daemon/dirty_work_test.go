@@ -166,8 +166,8 @@ func TestConfirmDirtyWorkBeforeRemovalRetainsUnprovenCheckouts(t *testing.T) {
 			if err := confirmDirtyWorkBeforeRemoval(context.Background(), wt, snap); err == nil || !strings.Contains(err.Error(), "stability through removal cannot be proven") {
 				t.Fatalf("unproven cleanup did not record its retention reason: %v", err)
 			}
-			removed := removeOrphanWorktree(context.Background(), orphanWorktree{gateDir: gate, dir: wt, repoID: "repo1", runID: runID, baseSHA: head})
-			if removed {
+			removed := removeOrphanWorktrees(context.Background(), p.WorktreesDir(), []orphanWorktree{{gateDir: gate, dir: wt, repoID: "repo1", runID: runID, baseSHA: head}}, "test")
+			if removed != 0 {
 				t.Fatal("orphan cleanup deleted an unproven checkout")
 			}
 			NewRunManager(d, p, nil).removeRunWorktree(context.Background(), "repo1", runID, gate, wt, "unproven stability")
@@ -213,13 +213,13 @@ func TestRemoveOrphanWorktreeKeepsDirtyWorkWhenCaptureFails(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	removed := removeOrphanWorktree(context.Background(), orphanWorktree{
+	removed := removeOrphanWorktrees(context.Background(), p.WorktreesDir(), []orphanWorktree{{
 		gateDir: gate,
 		dir:     wtDir,
 		repoID:  "repo1",
 		runID:   runID,
-	})
-	if removed {
+	}}, "test")
+	if removed != 0 {
 		t.Fatal("orphan removal deleted a checkout whose capture failed")
 	}
 	got, err := os.ReadFile(filepath.Join(wtDir, "test.txt"))

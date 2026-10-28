@@ -219,7 +219,7 @@ func TestRemoveOrphanWorktreeReportsRemovalFailure(t *testing.T) {
 	t.Cleanup(func() { os.Chmod(parent, 0o755) })
 
 	wt := orphanWorktree{gateDir: filepath.Join(tmp, "nonexistent-gate"), dir: wtDir, repoID: "repo1", runID: "run1"}
-	if removeOrphanWorktree(context.Background(), wt) {
+	if removeOrphanWorktrees(context.Background(), tmp, []orphanWorktree{wt}, "test") != 0 {
 		t.Fatal("removeOrphanWorktree reported success for a directory that is still on disk")
 	}
 	if _, err := os.Stat(wtDir); err != nil {

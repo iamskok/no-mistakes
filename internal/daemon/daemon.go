@@ -851,18 +851,7 @@ func cleanupOrphanWorktrees(ctx context.Context, d *db.DB, p *paths.Paths, lefto
 		return
 	}
 
-	sweepable := make([]procreap.Worktree, 0, len(removable))
-	for _, wt := range removable {
-		sweepable = append(sweepable, procreap.Worktree{Dir: wt.dir, RepoID: wt.repoID, RunID: wt.runID})
-	}
-	sweepRunWorktrees(ctx, p.WorktreesDir(), sweepable, "worktree_cleanup")
-
-	for _, wt := range removable {
-		if ctx.Err() != nil {
-			return
-		}
-		removeOrphanWorktree(ctx, wt)
-	}
+	removeOrphanWorktrees(ctx, p.WorktreesDir(), removable, "worktree_cleanup")
 	for _, dir := range repoDirs {
 		if ctx.Err() != nil {
 			return
@@ -1021,6 +1010,32 @@ func confirmDirtyWorkBeforeRemoval(ctx context.Context, wtDir string, snap *git.
 	return nil
 }
 
+func removeOrphanWorktrees(ctx context.Context, root string, worktrees []orphanWorktree, reason string) int {
+	if len(worktrees) == 0 || ctx.Err() != nil {
+		return 0
+	}
+	paths := make([]string, 0, len(worktrees))
+	sweepable := make([]procreap.Worktree, 0, len(worktrees))
+	for _, wt := range worktrees {
+		paths = append(paths, wt.dir)
+		sweepable = append(sweepable, procreap.Worktree{Dir: wt.dir, RepoID: wt.repoID, RunID: wt.runID})
+	}
+	removed := 0
+	_ = git.WithDirtyWorkCheckouts(ctx, paths, func() error {
+		sweepRunWorktrees(ctx, root, sweepable, reason)
+		for _, wt := range worktrees {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if removeOrphanWorktree(ctx, wt) {
+				removed++
+			}
+		}
+		return nil
+	})
+	return removed
+}
+
 // removeOrphanWorktree attempts cleanup of one run worktree directory its
 // caller has selected and swept (see cleanupOrphanWorktrees). It reports
 // whether the directory was actually removed, since git worktree remove and
@@ -1034,40 +1049,31 @@ func removeOrphanWorktree(ctx context.Context, wt orphanWorktree) bool {
 		return false
 	}
 	gateDir, wtPath := wt.gateDir, wt.dir
-	removed := false
-	// Same checkout lock as removeRunWorktree: capture through removal.
-	err := git.WithDirtyWorkCheckout(ctx, wtPath, func() error {
-		snap, err := captureDirtyWorkBeforeRemoval(ctx, gateDir, wtPath, wt.runID, wt.baseSHA)
-		if err != nil {
-			slog.Warn("preserving orphan worktree: unique uncommitted work was not captured", "path", wtPath, "run_id", wt.runID, "error", err)
-			return err
-		}
-		if err := confirmDirtyWorkBeforeRemoval(ctx, wtPath, snap); err != nil {
-			slog.Warn("preserving orphan worktree: cleanup verification refused", "path", wtPath, "run_id", wt.runID, "error", err)
-			return err
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := git.WorktreeRemove(ctx, gateDir, wtPath); err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			slog.Warn("git worktree remove failed, falling back to os.RemoveAll", "path", wtPath, "error", err)
-			if err := os.RemoveAll(wtPath); err != nil {
-				slog.Warn("failed to remove orphaned worktree", "path", wtPath, "error", err)
-				return err
-			}
-		} else {
-			slog.Info("removed orphaned worktree", "path", wtPath)
-		}
-		removed = true
-		return nil
-	})
+	snap, err := captureDirtyWorkBeforeRemoval(ctx, gateDir, wtPath, wt.runID, wt.baseSHA)
 	if err != nil {
+		slog.Warn("preserving orphan worktree: unique uncommitted work was not captured", "path", wtPath, "run_id", wt.runID, "error", err)
 		return false
 	}
-	return removed
+	if err := confirmDirtyWorkBeforeRemoval(ctx, wtPath, snap); err != nil {
+		slog.Warn("preserving orphan worktree: cleanup verification refused", "path", wtPath, "run_id", wt.runID, "error", err)
+		return false
+	}
+	if err := ctx.Err(); err != nil {
+		return false
+	}
+	if err := git.WorktreeRemove(ctx, gateDir, wtPath); err != nil {
+		if ctx.Err() != nil {
+			return false
+		}
+		slog.Warn("git worktree remove failed, falling back to os.RemoveAll", "path", wtPath, "error", err)
+		if err := os.RemoveAll(wtPath); err != nil {
+			slog.Warn("failed to remove orphaned worktree", "path", wtPath, "error", err)
+			return false
+		}
+	} else {
+		slog.Info("removed orphaned worktree", "path", wtPath)
+	}
+	return true
 }
 
 // skipWorktreeCleanup reports whether the worktree directory for runID must

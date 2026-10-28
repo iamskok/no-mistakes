@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/kunchenguid/no-mistakes/internal/safeurl"
 	"github.com/kunchenguid/no-mistakes/internal/shellenv"
 	"github.com/kunchenguid/no-mistakes/internal/winproc"
 )
@@ -521,14 +522,14 @@ var (
 	dirtyWorkAfterBookkeeping  func(string)
 )
 
-func dirtyWorkMu(worktree string) chan struct{} {
+func dirtyWorkLockIndex(worktree string) uint32 {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(canonicalPath(worktree)))
-	return dirtyWorkLocks[h.Sum32()%dirtyWorkLockStripes]
+	return h.Sum32() % dirtyWorkLockStripes
 }
 
 func dirtyWorkCheckoutLocked(worktree string) bool {
-	mu := dirtyWorkMu(worktree)
+	mu := dirtyWorkLocks[dirtyWorkLockIndex(worktree)]
 	select {
 	case mu <- struct{}{}:
 		<-mu
@@ -538,20 +539,29 @@ func dirtyWorkCheckoutLocked(worktree string) bool {
 	}
 }
 
-// WithDirtyWorkCheckout serializes snapshot and removal of one checkout.
+// WithDirtyWorkCheckouts serializes sweeping, snapshot, and removal of checkouts.
 // Callers hold it across capture, the pre-removal recheck, and deletion so
 // an older pass paused before publishing cannot replace the ref written by
 // the pass that already deleted the checkout.
-func WithDirtyWorkCheckout(ctx context.Context, worktree string, fn func() error) error {
+func WithDirtyWorkCheckouts(ctx context.Context, worktrees []string, fn func() error) error {
 	if dirtyWorkBeforeLock != nil {
 		dirtyWorkBeforeLock()
 	}
-	mu := dirtyWorkMu(worktree)
-	select {
-	case mu <- struct{}{}:
-		defer func() { <-mu }()
-	case <-ctx.Done():
-		return ctx.Err()
+	var selected [dirtyWorkLockStripes]bool
+	for _, worktree := range worktrees {
+		selected[dirtyWorkLockIndex(worktree)] = true
+	}
+	for index, acquire := range selected {
+		if !acquire {
+			continue
+		}
+		mu := dirtyWorkLocks[index]
+		select {
+		case mu <- struct{}{}:
+			defer func() { <-mu }()
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -1083,7 +1093,7 @@ func gitStreamTo(ctx context.Context, dir string, env []string, dst io.Writer, a
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		return fmt.Errorf("git %s: %w: %s", safeurl.RedactText(strings.Join(args, " ")), err, safeurl.RedactText(strings.TrimSpace(stderr.String())))
 	}
 	return nil
 }
@@ -1912,15 +1922,7 @@ func ignoredPathSet(ctx context.Context, wt string, paths []string) (map[string]
 		input.WriteString(rel)
 		input.WriteByte(0)
 	}
-	cmd := exec.CommandContext(ctx, "git", "check-ignore", "-z", "--stdin")
-	cmd.Dir = wt
-	cmd.Stdin = &input
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	cmd.Env = nonInteractiveEnvForContext(ctx, wt)
-	winproc.Harden(cmd)
-	shellenv.ConfigureShellCommand(cmd)
-	out, err := shellenv.OutputShellCommand(cmd)
+	out, err := runInDirWithEnvAndInputRaw(ctx, wt, nil, input.String(), "check-ignore", "-z", "--stdin")
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
@@ -1929,7 +1931,7 @@ func ignoredPathSet(ctx context.Context, wt string, paths []string) (map[string]
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, fmt.Errorf("check ignored paths: %w: %s", err, strings.TrimSpace(stderr.String()))
+		return nil, fmt.Errorf("check ignored paths: %w", err)
 	}
 	ignored := make(map[string]struct{})
 	for _, raw := range bytes.Split(out, []byte{0}) {

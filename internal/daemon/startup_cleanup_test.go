@@ -33,6 +33,11 @@ func runStartupCleanupFilterProcess(mode, root string) int {
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(filepath.Join(root, name+".release")); err == nil {
+			if mode == "smudge-pass" {
+				if _, err := io.Copy(os.Stdout, os.Stdin); err == nil {
+					return 0
+				}
+			}
 			return 1
 		}
 		time.Sleep(10 * time.Millisecond)

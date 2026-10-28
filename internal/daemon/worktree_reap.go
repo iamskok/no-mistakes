@@ -10,7 +10,6 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
-	"github.com/kunchenguid/no-mistakes/internal/procreap"
 )
 
 // worktreeReapPolicy selects leftover directories for attempted cleanup under
@@ -77,24 +76,7 @@ func reapWorktrees(ctx context.Context, d *db.DB, p *paths.Paths, policy worktre
 		return
 	}
 
-	// Only the directories actually selected for removal are swept: sweeping
-	// a retained worktree would kill processes still using a checkout the
-	// policy was meant to keep.
-	sweepable := make([]procreap.Worktree, 0, len(toRemove))
-	for _, wt := range toRemove {
-		sweepable = append(sweepable, procreap.Worktree{Dir: wt.dir, RepoID: wt.repoID, RunID: wt.runID})
-	}
-	sweepRunWorktrees(ctx, p.WorktreesDir(), sweepable, "worktree_reap")
-
-	removed := 0
-	for _, wt := range toRemove {
-		if ctx.Err() != nil {
-			break
-		}
-		if removeOrphanWorktree(ctx, wt) {
-			removed++
-		}
-	}
+	removed := removeOrphanWorktrees(ctx, p.WorktreesDir(), toRemove, "worktree_reap")
 
 	if removed > 0 {
 		slog.Info("reaped leftover run worktrees", "removed", removed)

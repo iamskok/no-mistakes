@@ -648,7 +648,7 @@ func TestWithDirtyWorkCheckoutCancellationDoesNotReleaseAnotherOwner(t *testing.
 	release := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
-		done <- WithDirtyWorkCheckout(context.Background(), wt, func() error {
+		done <- WithDirtyWorkCheckouts(context.Background(), []string{wt}, func() error {
 			close(entered)
 			<-release
 			return nil
@@ -659,7 +659,7 @@ func TestWithDirtyWorkCheckoutCancellationDoesNotReleaseAnotherOwner(t *testing.
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	called := false
-	err := WithDirtyWorkCheckout(ctx, wt, func() error { called = true; return nil })
+	err := WithDirtyWorkCheckouts(ctx, []string{wt}, func() error { called = true; return nil })
 	if !errors.Is(err, context.DeadlineExceeded) || called {
 		t.Fatalf("waiting cleanup = %v, ran = %t", err, called)
 	}
@@ -669,7 +669,7 @@ func TestWithDirtyWorkCheckoutCancellationDoesNotReleaseAnotherOwner(t *testing.
 }
 
 func removeLockedDirtyCheckout(ctx context.Context, gate, wt, runID string) error {
-	return WithDirtyWorkCheckout(ctx, wt, func() error {
+	return WithDirtyWorkCheckouts(ctx, []string{wt}, func() error {
 		snap, err := CaptureDirtyWork(ctx, DirtyWorkRequest{GateDir: gate, Worktree: wt, RunID: runID})
 		if err != nil {
 			return err

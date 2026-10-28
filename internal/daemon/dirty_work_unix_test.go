@@ -68,16 +68,16 @@ func TestRemoveOrphanWorktreeKeepsFifo(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var removed bool
+	var removed int
 	removeWithin(t, fifo, func() {
-		removed = removeOrphanWorktree(context.Background(), orphanWorktree{
+		removed = removeOrphanWorktrees(context.Background(), p.WorktreesDir(), []orphanWorktree{{
 			gateDir: gate,
 			dir:     wtDir,
 			repoID:  "repo1",
 			runID:   runID,
-		})
+		}}, "test")
 	})
-	if removed {
+	if removed != 0 {
 		t.Fatal("orphan removal deleted a checkout that contains a fifo")
 	}
 	if _, err := os.Stat(fifo); err != nil {
