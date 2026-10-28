@@ -38,7 +38,7 @@ func TestRemoveRunWorktreeKeepsFifo(t *testing.T) {
 	}
 
 	removeWithin(t, fifo, func() {
-		NewRunManager(d, p, nil).removeRunWorktree("repo1", runID, gate, wtDir, "test")
+		NewRunManager(d, p, nil).removeRunWorktree(context.Background(), "repo1", runID, gate, wtDir, "test")
 	})
 	if _, err := os.Stat(wtDir); err != nil {
 		t.Fatalf("fifo checkout was removed: %v", err)

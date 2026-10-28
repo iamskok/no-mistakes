@@ -41,6 +41,7 @@
 package procreap
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -89,6 +90,9 @@ type Worktree struct {
 
 // Options configures a sweep.
 type Options struct {
+	// Context bounds the whole sweep. Nil preserves the unbounded caller API.
+	Context context.Context
+
 	// WorktreesRoot is <NM_HOME>/worktrees. Required.
 	WorktreesRoot string
 
@@ -148,10 +152,17 @@ var (
 // error is the normal outcome and also what platforms without a process-table
 // reader (Windows, where job objects already contain the whole tree) return.
 func Sweep(opts Options) ([]Victim, error) {
+	ctx := opts.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if strings.TrimSpace(opts.WorktreesRoot) == "" && len(opts.Worktrees) == 0 {
 		return nil, nil
 	}
-	procs, err := listProcessesFunc()
+	procs, err := listProcessesFunc(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -179,7 +190,10 @@ func Sweep(opts Options) ([]Victim, error) {
 		return nil, nil
 	}
 
-	cwds := processCWDsFunc(candidates)
+	cwds := processCWDsFunc(ctx, candidates)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	matchers := worktreeMatchers(opts)
 	var scopes []string
 	for _, scope := range opts.Scopes {
@@ -206,7 +220,7 @@ func Sweep(opts Options) ([]Victim, error) {
 	}
 
 	victims := expandVictims(matched, procs, protected)
-	terminate(victims, opts.Grace)
+	terminate(ctx, victims, opts.Grace)
 	return victims, nil
 }
 
@@ -261,6 +275,12 @@ func SweepRunWorktree(worktreesRoot, repoID, runID, dir string, reason string) {
 // worktrees tree, with neither the age floor nor the run-active check an
 // unscoped caller must supply.
 func SweepRunWorktrees(worktreesRoot string, wts []Worktree, reason string) {
+	SweepRunWorktreesContext(context.Background(), worktreesRoot, wts, reason)
+}
+
+// SweepRunWorktreesContext shares its caller's cleanup deadline across process
+// discovery and termination, before any checkout capture or removal begins.
+func SweepRunWorktreesContext(ctx context.Context, worktreesRoot string, wts []Worktree, reason string) {
 	scopes := make([]string, 0, len(wts))
 	for _, wt := range wts {
 		if strings.TrimSpace(wt.Dir) == "" {
@@ -272,6 +292,7 @@ func SweepRunWorktrees(worktreesRoot string, wts []Worktree, reason string) {
 		return
 	}
 	SweepAndLog(Options{
+		Context:       ctx,
 		WorktreesRoot: worktreesRoot,
 		Worktrees:     wts,
 		Scopes:        scopes,
@@ -446,7 +467,7 @@ func expandVictims(matched map[int]string, procs []Process, protected map[int]bo
 // after grace. SIGTERM first is not politeness: a test runner or a worker
 // script given the chance to exit flushes its output and removes its own
 // temporary state, which SIGKILL denies it.
-func terminate(victims []Victim, grace time.Duration) {
+func terminate(ctx context.Context, victims []Victim, grace time.Duration) {
 	if grace <= 0 {
 		grace = DefaultGrace
 	}
@@ -462,10 +483,15 @@ func terminate(victims []Victim, grace time.Duration) {
 				break
 			}
 		}
-		if !remaining || !time.Now().Before(deadline) {
+		if !remaining || ctx.Err() != nil || !time.Now().Before(deadline) {
 			break
 		}
-		time.Sleep(50 * time.Millisecond)
+		timer := time.NewTimer(50 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+		case <-timer.C:
+		}
+		timer.Stop()
 	}
 	for i := range victims {
 		if !processAliveFunc(victims[i].PID) {

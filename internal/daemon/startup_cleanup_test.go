@@ -70,7 +70,7 @@ func newStartupCleanupFixture(t *testing.T) *startupCleanupFixture {
 	gitCmd(t, f.gate, "config", "filter.slow.smudge", command+"smudge "+shellQuoteForTest(filepath.ToSlash(f.controls)))
 	gitCmd(t, f.gate, "config", "filter.slow.required", "true")
 	previous := sweepRunWorktrees
-	sweepRunWorktrees = func(string, []procreap.Worktree, string) {}
+	sweepRunWorktrees = func(context.Context, string, []procreap.Worktree, string) {}
 	t.Cleanup(func() { sweepRunWorktrees = previous })
 	return f
 }

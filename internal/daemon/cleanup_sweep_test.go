@@ -57,7 +57,7 @@ func TestCleanupOrphanWorktreesSweepsEveryRemovableDirectoryInOneSnapshot(t *tes
 	var sweeps [][]procreap.Worktree
 	original := sweepRunWorktrees
 	t.Cleanup(func() { sweepRunWorktrees = original })
-	sweepRunWorktrees = func(worktreesRoot string, wts []procreap.Worktree, reason string) {
+	sweepRunWorktrees = func(ctx context.Context, worktreesRoot string, wts []procreap.Worktree, reason string) {
 		sweeps = append(sweeps, wts)
 	}
 

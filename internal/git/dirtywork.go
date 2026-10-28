@@ -15,7 +15,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 
 	"github.com/kunchenguid/no-mistakes/internal/shellenv"
 	"github.com/kunchenguid/no-mistakes/internal/winproc"
@@ -501,13 +500,19 @@ func readDirtyWorkRestoreConfig(ctx context.Context, wt, commit string) (dirtyWo
 }
 
 // dirtyWorkLocks stripes checkouts so two cleanups of one path cannot
-// interleave, without retaining a mutex per path for the life of the daemon.
+// interleave, without retaining a lock per path for the life of the daemon.
 const dirtyWorkLockStripes = 64
 
-var dirtyWorkLocks [dirtyWorkLockStripes]sync.Mutex
+var dirtyWorkLocks = func() [dirtyWorkLockStripes]chan struct{} {
+	var locks [dirtyWorkLockStripes]chan struct{}
+	for i := range locks {
+		locks[i] = make(chan struct{}, 1)
+	}
+	return locks
+}()
 
 // dirtyWorkBeforeLock and dirtyWorkBeforeRefUpdate are test seams. The lock
-// hook runs before the checkout mutex is taken. The ref hook runs after the
+// hook runs before the checkout lock is taken. The ref hook runs after the
 // snapshot matches and before update-ref, while the cleanup lock is held.
 var (
 	dirtyWorkBeforeLock        func()
@@ -516,32 +521,41 @@ var (
 	dirtyWorkAfterBookkeeping  func(string)
 )
 
-func dirtyWorkMu(worktree string) *sync.Mutex {
+func dirtyWorkMu(worktree string) chan struct{} {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(canonicalPath(worktree)))
-	return &dirtyWorkLocks[h.Sum32()%dirtyWorkLockStripes]
+	return dirtyWorkLocks[h.Sum32()%dirtyWorkLockStripes]
 }
 
 func dirtyWorkCheckoutLocked(worktree string) bool {
 	mu := dirtyWorkMu(worktree)
-	if mu.TryLock() {
-		mu.Unlock()
+	select {
+	case mu <- struct{}{}:
+		<-mu
 		return false
+	default:
+		return true
 	}
-	return true
 }
 
 // WithDirtyWorkCheckout serializes snapshot and removal of one checkout.
 // Callers hold it across capture, the pre-removal recheck, and deletion so
 // an older pass paused before publishing cannot replace the ref written by
 // the pass that already deleted the checkout.
-func WithDirtyWorkCheckout(worktree string, fn func() error) error {
+func WithDirtyWorkCheckout(ctx context.Context, worktree string, fn func() error) error {
 	if dirtyWorkBeforeLock != nil {
 		dirtyWorkBeforeLock()
 	}
 	mu := dirtyWorkMu(worktree)
-	mu.Lock()
-	defer mu.Unlock()
+	select {
+	case mu <- struct{}{}:
+		defer func() { <-mu }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return fn()
 }
 

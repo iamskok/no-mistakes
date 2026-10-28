@@ -30,7 +30,7 @@ func TestRemoveRunWorktreeCapturesAndRetainsUnprovenCheckout(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	NewRunManager(d, p, nil).removeRunWorktree("repo1", runID, p.RepoDir("repo1"), wtDir, "test")
+	NewRunManager(d, p, nil).removeRunWorktree(context.Background(), "repo1", runID, p.RepoDir("repo1"), wtDir, "test")
 
 	if got, err := os.ReadFile(filepath.Join(wtDir, "test.txt")); err != nil || string(got) != "unique dirty\n" {
 		t.Fatalf("unproven checkout was not retained: %q, %v", got, err)
@@ -73,7 +73,7 @@ func TestRemoveRunWorktreeKeepsDirtyWorkWhenCaptureFails(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	NewRunManager(d, p, nil).removeRunWorktree("repo1", runID, gate, wtDir, "test")
+	NewRunManager(d, p, nil).removeRunWorktree(context.Background(), "repo1", runID, gate, wtDir, "test")
 
 	got, err := os.ReadFile(filepath.Join(wtDir, "test.txt"))
 	if err != nil {
@@ -109,7 +109,7 @@ func TestRemoveRunWorktreeCapturesAndRetainsSymlinkCheckout(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	NewRunManager(d, p, nil).removeRunWorktree("repo1", runID, gate, wtDir, "test")
+	NewRunManager(d, p, nil).removeRunWorktree(context.Background(), "repo1", runID, gate, wtDir, "test")
 
 	if _, err := os.Stat(wtDir); err != nil {
 		t.Fatalf("unproven symlink checkout was removed: %v", err)
@@ -170,7 +170,7 @@ func TestConfirmDirtyWorkBeforeRemovalRetainsUnprovenCheckouts(t *testing.T) {
 			if removed {
 				t.Fatal("orphan cleanup deleted an unproven checkout")
 			}
-			NewRunManager(d, p, nil).removeRunWorktree("repo1", runID, gate, wt, "unproven stability")
+			NewRunManager(d, p, nil).removeRunWorktree(context.Background(), "repo1", runID, gate, wt, "unproven stability")
 			if _, err := os.Stat(wt); err != nil {
 				t.Fatalf("run cleanup deleted an unproven checkout: %v", err)
 			}

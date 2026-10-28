@@ -167,7 +167,7 @@ func TestRunCleanupReapsLeftoverWorktreesAcrossTheWholeTree(t *testing.T) {
 
 	cfg := config.Merge(config.DefaultGlobalConfig(), &config.RepoConfig{})
 	cfg.Worktree.Retention = 14 * 24 * time.Hour
-	m.cleanupRunEvidence(cfg, fresh)
+	m.cleanupRunEvidence(context.Background(), cfg, fresh)
 
 	if f.exists(stale) {
 		t.Error("a stale leftover worktree survived cleanup of an unrelated run")
@@ -185,7 +185,7 @@ func TestRunCleanupWorktreeReapIsSafeWithoutConfig(t *testing.T) {
 
 	kept := f.seed("kept", types.RunCompleted, time.Minute)
 
-	m.cleanupRunEvidence(nil, "run-that-never-existed")
+	m.cleanupRunEvidence(context.Background(), nil, "run-that-never-existed")
 
 	if !f.exists(kept) {
 		t.Error("cleanup with no config removed a fresh leftover worktree")

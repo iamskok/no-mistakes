@@ -642,8 +642,34 @@ func TestDirtyWorkCleanup_OlderPassCannotReplaceNewerSnapshot(t *testing.T) {
 	}
 }
 
+func TestWithDirtyWorkCheckoutCancellationDoesNotReleaseAnotherOwner(t *testing.T) {
+	wt := t.TempDir()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- WithDirtyWorkCheckout(context.Background(), wt, func() error {
+			close(entered)
+			<-release
+			return nil
+		})
+	}()
+	t.Cleanup(func() { close(release); <-done })
+	<-entered
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	called := false
+	err := WithDirtyWorkCheckout(ctx, wt, func() error { called = true; return nil })
+	if !errors.Is(err, context.DeadlineExceeded) || called {
+		t.Fatalf("waiting cleanup = %v, ran = %t", err, called)
+	}
+	if !dirtyWorkCheckoutLocked(wt) {
+		t.Fatal("cancelled waiter released the active cleanup's ownership")
+	}
+}
+
 func removeLockedDirtyCheckout(ctx context.Context, gate, wt, runID string) error {
-	return WithDirtyWorkCheckout(wt, func() error {
+	return WithDirtyWorkCheckout(ctx, wt, func() error {
 		snap, err := CaptureDirtyWork(ctx, DirtyWorkRequest{GateDir: gate, Worktree: wt, RunID: runID})
 		if err != nil {
 			return err

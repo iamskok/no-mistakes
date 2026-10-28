@@ -106,7 +106,7 @@ func TestProtectedPathRefusalCancellationCleanup(t *testing.T) {
 				assertProtectedWorktreePreserved(t, workDir, head)
 				return
 			}
-			NewRunManager(database, p, nil).removeRunWorktree(repo.ID, result.RunID, p.RepoDir(repo.ID), workDir, "retention after abort")
+			NewRunManager(database, p, nil).removeRunWorktree(context.Background(), repo.ID, result.RunID, p.RepoDir(repo.ID), workDir, "retention after abort")
 			assertProtectedWorktreePreserved(t, workDir, head)
 		})
 	}

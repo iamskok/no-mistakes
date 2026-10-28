@@ -84,7 +84,7 @@ func reapWorktrees(ctx context.Context, d *db.DB, p *paths.Paths, policy worktre
 	for _, wt := range toRemove {
 		sweepable = append(sweepable, procreap.Worktree{Dir: wt.dir, RepoID: wt.repoID, RunID: wt.runID})
 	}
-	sweepRunWorktrees(p.WorktreesDir(), sweepable, "worktree_reap")
+	sweepRunWorktrees(ctx, p.WorktreesDir(), sweepable, "worktree_reap")
 
 	removed := 0
 	for _, wt := range toRemove {

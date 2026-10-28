@@ -489,9 +489,9 @@ func recoverOnStartup(d *db.DB, p *paths.Paths, mgr *RunManager, layout *worktre
 	evidenceStarted := time.Now()
 	policy := evidenceReapPolicyFor(global)
 	root := evidenceRootFor(p, global)
-	reapEvidence(d, root, policy, now)
+	reapEvidence(context.Background(), d, root, policy, now)
 	reapLegacyEvidence(d, root, policy, now)
-	reapRunLogs(d, p.LogsDir(), policy, now)
+	reapRunLogs(context.Background(), d, p.LogsDir(), policy, now)
 	logStartupPhase("evidence_cleanup", evidenceStarted)
 
 	mgr.resumeRecoveredRuns(plans)
@@ -855,7 +855,7 @@ func cleanupOrphanWorktrees(ctx context.Context, d *db.DB, p *paths.Paths, lefto
 	for _, wt := range removable {
 		sweepable = append(sweepable, procreap.Worktree{Dir: wt.dir, RepoID: wt.repoID, RunID: wt.runID})
 	}
-	sweepRunWorktrees(p.WorktreesDir(), sweepable, "worktree_cleanup")
+	sweepRunWorktrees(ctx, p.WorktreesDir(), sweepable, "worktree_cleanup")
 
 	for _, wt := range removable {
 		if ctx.Err() != nil {
@@ -1036,7 +1036,7 @@ func removeOrphanWorktree(ctx context.Context, wt orphanWorktree) bool {
 	gateDir, wtPath := wt.gateDir, wt.dir
 	removed := false
 	// Same checkout lock as removeRunWorktree: capture through removal.
-	err := git.WithDirtyWorkCheckout(wtPath, func() error {
+	err := git.WithDirtyWorkCheckout(ctx, wtPath, func() error {
 		snap, err := captureDirtyWorkBeforeRemoval(ctx, gateDir, wtPath, wt.runID, wt.baseSHA)
 		if err != nil {
 			slog.Warn("preserving orphan worktree: unique uncommitted work was not captured", "path", wtPath, "run_id", wt.runID, "error", err)
@@ -1152,7 +1152,7 @@ type gateMigrationStats struct {
 
 var ensureGateHooksPathIsolation = git.EnsureHooksPathIsolation
 
-var sweepRunWorktrees = procreap.SweepRunWorktrees
+var sweepRunWorktrees = procreap.SweepRunWorktreesContext
 
 // migrateGateConfigs discovers gates from authoritative DB records plus legacy
 // directories with the strict <id>.git shape. Every unstamped candidate is
