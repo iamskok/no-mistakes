@@ -56,6 +56,10 @@ type startupCleanupFixture struct {
 func newStartupCleanupFixture(t *testing.T) *startupCleanupFixture {
 	t.Helper()
 	p := paths.WithRoot(t.TempDir())
+	scratch := t.TempDir()
+	t.Setenv("TMPDIR", scratch)
+	t.Setenv("TMP", scratch)
+	t.Setenv("TEMP", scratch)
 	if err := p.EnsureDirs(); err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +120,7 @@ func (f *startupCleanupFixture) release(t *testing.T, wt orphanWorktree) {
 
 func waitForStartupCleanupFilter(t *testing.T, marker string, done <-chan struct{}) {
 	t.Helper()
-	deadline := time.NewTimer(startupWorktreeCleanupTimeout + 5*time.Second)
+	deadline := time.NewTimer(startupCleanupTimeout + 5*time.Second)
 	defer deadline.Stop()
 	tick := time.NewTicker(10 * time.Millisecond)
 	defer tick.Stop()
@@ -165,7 +169,7 @@ func TestStartupCleanupCancellationReachesCaptureAndConfirmation(t *testing.T) {
 					confirmErr = confirmDirtyWorkBeforeRemoval(ctx, wt.dir, nil)
 					return
 				}
-				cleanupStartupWorktrees(ctx, f.d, f.p, worktreeReapPolicy{Retention: time.Nanosecond}, time.Now().Add(time.Hour), leftover)
+				cleanupStartupStorage(ctx, f.d, f.p, nil, worktreeReapPolicy{Retention: time.Nanosecond}, time.Now().Add(time.Hour), leftover)
 			}()
 			t.Cleanup(func() {
 				cancel()
@@ -192,13 +196,33 @@ func TestStartupCleanupCancellationReachesCaptureAndConfirmation(t *testing.T) {
 }
 
 func TestStartupCleanupSharesOneBudgetAcrossCandidatesAndSweeps(t *testing.T) {
-	if startupWorktreeCleanupTimeout >= 45*time.Second {
+	if startupCleanupTimeout >= 45*time.Second {
 		t.Fatal("worktree cleanup budget reaches the earliest readiness timeout")
 	}
 	f := newStartupCleanupFixture(t)
 	first := f.checkout(t, false)
 	second := f.checkout(t, false)
 	recorded := f.checkout(t, true)
+	storageFiles := []string{
+		filepath.Join(f.p.EvidenceDir(), first.runID, "proof.log"),
+		filepath.Join(f.p.RunLogDir(first.runID), "proof.log"),
+		filepath.Join(os.TempDir(), legacyEvidenceDirName, first.runID, "proof.log"),
+	}
+	stale := time.Now().Add(-60 * 24 * time.Hour)
+	for _, file := range storageFiles {
+		if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(file, []byte("retained storage bytes"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(file, stale, stale); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(filepath.Dir(file), stale, stale); err != nil {
+			t.Fatal(err)
+		}
+	}
 	old := time.Now().Add(-2 * time.Hour)
 	if err := os.Chtimes(first.dir, old, old); err != nil {
 		t.Fatal(err)
@@ -209,7 +233,7 @@ func TestStartupCleanupSharesOneBudgetAcrossCandidatesAndSweeps(t *testing.T) {
 	started := time.Now()
 	go func() {
 		defer close(done)
-		cleanupStartupWorktrees(ctx, f.d, f.p, worktreeReapPolicy{Retention: time.Nanosecond}, time.Now().Add(time.Hour), leftover)
+		cleanupStartupStorage(ctx, f.d, f.p, nil, worktreeReapPolicy{Retention: time.Nanosecond}, time.Now().Add(time.Hour), leftover)
 	}()
 	t.Cleanup(func() {
 		cancel()
@@ -223,12 +247,12 @@ func TestStartupCleanupSharesOneBudgetAcrossCandidatesAndSweeps(t *testing.T) {
 		}
 	})
 	waitForStartupCleanupFilter(t, f.entered(first), done)
-	if delay := time.Until(started.Add(startupWorktreeCleanupTimeout / 2)); delay > 0 {
+	if delay := time.Until(started.Add(startupCleanupTimeout / 2)); delay > 0 {
 		time.Sleep(delay)
 	}
 	f.release(t, first)
 	waitForStartupCleanupFilter(t, f.entered(second), done)
-	remaining := time.Until(started.Add(startupWorktreeCleanupTimeout + 5*time.Second))
+	remaining := time.Until(started.Add(startupCleanupTimeout + 5*time.Second))
 	select {
 	case <-done:
 	case <-time.After(max(remaining, time.Millisecond)):
@@ -239,5 +263,10 @@ func TestStartupCleanupSharesOneBudgetAcrossCandidatesAndSweeps(t *testing.T) {
 	}
 	for _, wt := range []orphanWorktree{first, second, recorded} {
 		assertStartupCheckoutRetained(t, wt)
+	}
+	for _, file := range storageFiles {
+		if got, err := os.ReadFile(file); err != nil || string(got) != "retained storage bytes" {
+			t.Fatalf("later storage cleanup restarted the exhausted budget: %v", err)
+		}
 	}
 }

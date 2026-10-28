@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/kunchenguid/no-mistakes/internal/fsutil"
 	"github.com/kunchenguid/no-mistakes/internal/safeurl"
 	"github.com/kunchenguid/no-mistakes/internal/shellenv"
 	"github.com/kunchenguid/no-mistakes/internal/winproc"
@@ -164,7 +165,7 @@ func DirtyWorkStillMatches(ctx context.Context, worktree string, snap *DirtyWork
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(tmp)
+	defer fsutil.RemoveAll(ctx, tmp)
 	return recheckDirtyWork(ctx, worktree, tmp, head, indexTree, workTree, untrackedTree, config, nil)
 }
 
@@ -762,7 +763,7 @@ func secretPath(rel string) bool {
 	slashed := filepath.ToSlash(rel)
 	base := strings.ToLower(filepath.Base(slashed))
 	switch base {
-	case ".env", "credentials", "credentials.json", "credentials.yml", "credentials.yaml",
+	case ".env", ".npmrc", ".git-credentials", "credentials", "credentials.json", "credentials.yml", "credentials.yaml",
 		"secrets.json", "secrets.yaml", "secrets.yml",
 		"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519":
 		return true
@@ -1112,7 +1113,7 @@ func writeDirtySnapshot(ctx context.Context, req DirtyWorkRequest, ref string, e
 	if err != nil {
 		return nil, err
 	}
-	defer os.RemoveAll(tmp)
+	defer fsutil.RemoveAll(ctx, tmp)
 
 	prepared, err := prepareDirtyContent(ctx, wt, tmp, entries)
 	if err != nil {
@@ -1960,7 +1961,7 @@ func assertCheckoutClean(ctx context.Context, wt string, observed map[string]os.
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(tmp)
+	defer fsutil.RemoveAll(ctx, tmp)
 	return recheckDirtyWork(ctx, wt, tmp, head, tree, tree, "", config, observed)
 }
 

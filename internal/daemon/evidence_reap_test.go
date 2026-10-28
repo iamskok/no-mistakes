@@ -238,7 +238,7 @@ func TestReapLegacyEvidenceDrainsTheSharedTempRootUnderTheSamePolicy(t *testing.
 	fresh := seedLegacy("legacy-fresh", types.RunCompleted, time.Hour)
 	inFlight := seedLegacy("legacy-active", types.RunRunning, 30*24*time.Hour)
 
-	reapLegacyEvidence(f.db, f.root, evidenceReapPolicy{Retention: 14 * 24 * time.Hour}, time.Now())
+	reapLegacyEvidence(context.Background(), f.db, f.root, evidenceReapPolicy{Retention: 14 * 24 * time.Hour}, time.Now())
 
 	if _, err := os.Stat(filepath.Join(legacy, stale)); err == nil {
 		t.Error("stale legacy evidence survived the drain")
@@ -266,7 +266,7 @@ func TestReapLegacyEvidenceLeavesTheCurrentRootAlone(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reapLegacyEvidence(f.db, legacy, evidenceReapPolicy{Retention: time.Nanosecond}, time.Now())
+	reapLegacyEvidence(context.Background(), f.db, legacy, evidenceReapPolicy{Retention: time.Nanosecond}, time.Now())
 
 	if _, err := os.Stat(filepath.Join(legacy, "run-x")); err != nil {
 		t.Errorf("the drain reaped the configured current root: %v", err)

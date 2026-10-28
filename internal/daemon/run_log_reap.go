@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/fsutil"
 )
 
 // reapRunLogs bounds <NM_HOME>/logs/<run_id>, the per-run step-log directory
@@ -98,7 +99,7 @@ func reapRunLogs(ctx context.Context, d *db.DB, root string, policy evidenceReap
 		}
 		expired := policy.Retention > 0 && now.Sub(c.modTime) > policy.Retention
 		if expired {
-			if removeRunLogDir(c.path, c.runID) {
+			if removeRunLogDir(ctx, c.path, c.runID) {
 				removed++
 			}
 			continue
@@ -111,7 +112,7 @@ func reapRunLogs(ctx context.Context, d *db.DB, root string, policy evidenceReap
 			if ctx.Err() != nil {
 				return
 			}
-			if removeRunLogDir(c.path, c.runID) {
+			if removeRunLogDir(ctx, c.path, c.runID) {
 				removed++
 			}
 		}
@@ -122,8 +123,8 @@ func reapRunLogs(ctx context.Context, d *db.DB, root string, policy evidenceReap
 	}
 }
 
-func removeRunLogDir(path, runID string) bool {
-	if err := os.RemoveAll(path); err != nil {
+func removeRunLogDir(ctx context.Context, path, runID string) bool {
+	if err := fsutil.RemoveAll(ctx, path); err != nil {
 		slog.Warn("failed to remove run log directory", "path", path, "run_id", runID, "error", err)
 		return false
 	}

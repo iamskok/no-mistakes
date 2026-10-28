@@ -10,6 +10,7 @@ import (
 
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/fsutil"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
 )
 
@@ -146,7 +147,7 @@ func reapEvidence(ctx context.Context, d *db.DB, root string, policy evidenceRea
 		}
 		expired := policy.Retention > 0 && now.Sub(c.modTime) > policy.Retention
 		if c.isEmpty || expired {
-			if removeEvidenceDir(c.path, c.runID) {
+			if removeEvidenceDir(ctx, c.path, c.runID) {
 				removed++
 			}
 			continue
@@ -159,7 +160,7 @@ func reapEvidence(ctx context.Context, d *db.DB, root string, policy evidenceRea
 			if ctx.Err() != nil {
 				return
 			}
-			if removeEvidenceDir(c.path, c.runID) {
+			if removeEvidenceDir(ctx, c.path, c.runID) {
 				removed++
 			}
 		}
@@ -170,8 +171,8 @@ func reapEvidence(ctx context.Context, d *db.DB, root string, policy evidenceRea
 	}
 }
 
-func removeEvidenceDir(path, runID string) bool {
-	if err := os.RemoveAll(path); err != nil {
+func removeEvidenceDir(ctx context.Context, path, runID string) bool {
+	if err := fsutil.RemoveAll(ctx, path); err != nil {
 		slog.Warn("failed to remove run evidence", "path", path, "run_id", runID, "error", err)
 		return false
 	}
@@ -184,7 +185,10 @@ func removeEvidenceDir(path, runID string) bool {
 // moving files would not repair them, and a wholesale removal could delete
 // artifacts a run started before the upgrade is still writing. Reaping by the
 // same rules, with the same active-run guard, is bounded and surprises nobody.
-func reapLegacyEvidence(d *db.DB, current string, policy evidenceReapPolicy, now time.Time) {
+func reapLegacyEvidence(ctx context.Context, d *db.DB, current string, policy evidenceReapPolicy, now time.Time) {
+	if ctx.Err() != nil {
+		return
+	}
 	legacy := filepath.Join(os.TempDir(), legacyEvidenceDirName)
 	if legacy == current {
 		return // an operator who pointed local_root back at it owns it now
@@ -192,8 +196,10 @@ func reapLegacyEvidence(d *db.DB, current string, policy evidenceReapPolicy, now
 	if _, err := os.Stat(legacy); err != nil {
 		return
 	}
-	reapEvidence(context.Background(), d, legacy, policy, now)
+	reapEvidence(ctx, d, legacy, policy, now)
 	// Remove the root itself once it is empty; os.Remove fails harmlessly while
 	// anything remains.
-	_ = os.Remove(legacy)
+	if ctx.Err() == nil {
+		_ = os.Remove(legacy)
+	}
 }

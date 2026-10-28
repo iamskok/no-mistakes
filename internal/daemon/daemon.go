@@ -20,6 +20,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/custody"
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/fsutil"
 	"github.com/kunchenguid/no-mistakes/internal/gatecontext"
 	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
@@ -479,20 +480,7 @@ func recoverOnStartup(d *db.DB, p *paths.Paths, mgr *RunManager, layout *worktre
 	// retention window is honored on the default tree instead of being
 	// bypassed by startup cleanup. Both preserve real checkouts even when
 	// clean or successfully snapshotted, because removal stability is unproven.
-	worktreeStarted := time.Now()
-	cleanupStartupWorktrees(context.Background(), d, p, wtPolicy, now, leftover)
-	logStartupPhase("worktree_cleanup", worktreeStarted)
-
-	// Evidence is reaped after stale-run recovery for the same reason worktrees
-	// are: every run's status is settled by now, so the active-run guard can
-	// tell a crashed run's leftovers from work still in flight.
-	evidenceStarted := time.Now()
-	policy := evidenceReapPolicyFor(global)
-	root := evidenceRootFor(p, global)
-	reapEvidence(context.Background(), d, root, policy, now)
-	reapLegacyEvidence(d, root, policy, now)
-	reapRunLogs(context.Background(), d, p.LogsDir(), policy, now)
-	logStartupPhase("evidence_cleanup", evidenceStarted)
+	cleanupStartupStorage(context.Background(), d, p, global, wtPolicy, now, leftover)
 
 	mgr.resumeRecoveredRuns(plans)
 }
@@ -801,15 +789,24 @@ func reportUnusableWorktreeRoots(d *db.DB, layout *worktrees.Layout) {
 	}
 }
 
-const startupWorktreeCleanupTimeout = 10 * time.Second
+const startupCleanupTimeout = 10 * time.Second
 
-func cleanupStartupWorktrees(ctx context.Context, d *db.DB, p *paths.Paths, policy worktreeReapPolicy, now time.Time, leftover []db.RunWorktree) {
-	ctx, cancel := context.WithTimeout(ctx, startupWorktreeCleanupTimeout)
+func cleanupStartupStorage(ctx context.Context, d *db.DB, p *paths.Paths, global *config.GlobalConfig, policy worktreeReapPolicy, now time.Time, leftover []db.RunWorktree) {
+	ctx, cancel := context.WithTimeout(ctx, startupCleanupTimeout)
 	defer cancel()
+	worktreeStarted := time.Now()
 	reapWorktrees(ctx, d, p, policy, now)
 	cleanupOrphanWorktrees(ctx, d, p, leftover)
+	logStartupPhase("worktree_cleanup", worktreeStarted)
+	evidenceStarted := time.Now()
+	evidencePolicy := evidenceReapPolicyFor(global)
+	root := evidenceRootFor(p, global)
+	reapEvidence(ctx, d, root, evidencePolicy, now)
+	reapLegacyEvidence(ctx, d, root, evidencePolicy, now)
+	reapRunLogs(ctx, d, p.LogsDir(), evidencePolicy, now)
+	logStartupPhase("evidence_cleanup", evidenceStarted)
 	if err := ctx.Err(); err != nil {
-		slog.Warn("startup worktree cleanup stopped; unfinished checkouts retained", "error", err)
+		slog.Warn("startup storage cleanup stopped; unfinished directories retained", "error", err)
 	}
 }
 
@@ -1039,11 +1036,11 @@ func removeOrphanWorktrees(ctx context.Context, root string, worktrees []orphanW
 // removeOrphanWorktree attempts cleanup of one run worktree directory its
 // caller has selected and swept (see cleanupOrphanWorktrees). It reports
 // whether the directory was actually removed, since git worktree remove and
-// its os.RemoveAll fallback can both fail and merely log a warning.
+// its recursive fallback can both fail and merely log a warning.
 //
 // Capture failure or confirmDirtyWorkBeforeRemoval's preservation refusal
 // returns false without removal. Only non-checkout leftovers can currently
-// reach git worktree remove or its os.RemoveAll fallback.
+// reach git worktree remove or its recursive fallback.
 func removeOrphanWorktree(ctx context.Context, wt orphanWorktree) bool {
 	if ctx.Err() != nil {
 		return false
@@ -1065,8 +1062,8 @@ func removeOrphanWorktree(ctx context.Context, wt orphanWorktree) bool {
 		if ctx.Err() != nil {
 			return false
 		}
-		slog.Warn("git worktree remove failed, falling back to os.RemoveAll", "path", wtPath, "error", err)
-		if err := os.RemoveAll(wtPath); err != nil {
+		slog.Warn("git worktree remove failed, falling back to recursive cleanup", "path", wtPath, "error", err)
+		if err := fsutil.RemoveAll(ctx, wtPath); err != nil {
 			slog.Warn("failed to remove orphaned worktree", "path", wtPath, "error", err)
 			return false
 		}
