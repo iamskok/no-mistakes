@@ -31,7 +31,8 @@
 //     (Options.RunActive).
 //   - Unscoped sweeps additionally require Options.MinAge, so a process that
 //     started moments ago is never mistaken for a leak.
-//   - SIGTERM first; SIGKILL only for what is still alive after Options.Grace.
+//   - SIGTERM first; SIGKILL for what is still alive when Options.Grace ends
+//     or the cleanup context is cancelled.
 //
 // A process whose cwd is outside <NM_HOME>/worktrees and outside the run
 // worktrees the caller names explicitly (Options.Worktrees) can never match,
@@ -58,8 +59,7 @@ const (
 	// to a run the daemon is about to resume is never a candidate.
 	DefaultMinAge = 10 * time.Minute
 
-	// DefaultGrace is how long a matched process may take to exit after
-	// SIGTERM before it is SIGKILLed.
+	// DefaultGrace is the default Options.Grace limit.
 	DefaultGrace = 3 * time.Second
 )
 
@@ -133,8 +133,8 @@ type Options struct {
 	// only correct for a scoped sweep. Ignored when Scopes is set.
 	RunActive func(repoID, runID string) bool
 
-	// Grace is how long a signalled process may exit before SIGKILL.
-	// Zero means DefaultGrace.
+	// Grace is the maximum wait after SIGTERM before SIGKILL. Cancellation
+	// of Context ends the wait early. Zero means DefaultGrace.
 	Grace time.Duration
 }
 
@@ -464,9 +464,8 @@ func expandVictims(matched map[int]string, procs []Process, protected map[int]bo
 }
 
 // terminate asks every victim to exit, then kills whatever is still alive
-// after grace. SIGTERM first is not politeness: a test runner or a worker
-// script given the chance to exit flushes its output and removes its own
-// temporary state, which SIGKILL denies it.
+// when grace ends or ctx is cancelled. SIGTERM first lets a test runner or worker
+// script flush output and remove its own temporary state before forced cleanup.
 func terminate(ctx context.Context, victims []Victim, grace time.Duration) {
 	if grace <= 0 {
 		grace = DefaultGrace
