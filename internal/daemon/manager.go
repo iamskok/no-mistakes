@@ -692,10 +692,9 @@ func (m *RunManager) cleanupFinishedRun(cfg *config.Config, repoID, runID, gateD
 	}
 }
 
-// cleanupRunEvidence tidies up after one finished run, then bounds the whole
-// evidence directory, the run's own step-log directory (see reapRunLogs), and
-// any leftover run worktree that immediate removal did not clear (see
-// reapWorktrees).
+// cleanupRunEvidence tidies up after one finished run, then attempts retention
+// sweeps of evidence, step logs (see reapRunLogs), and leftover run worktrees
+// (see reapWorktrees), subject to ctx's shared cleanup deadline.
 //
 // The per-run half is deliberately os.Remove and not os.RemoveAll: it succeeds
 // only when the directory is empty, so a run that produced no artifact leaves
