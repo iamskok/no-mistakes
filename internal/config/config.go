@@ -1207,6 +1207,8 @@ type TestRaw struct {
 // Pointer fields distinguish "not set" (nil) from explicit zero/false values.
 type EvidenceRaw struct {
 	StoreInRepo *bool `yaml:"store_in_repo"`
+	// Compact controls PR testing-section presentation only; pushed-readable.
+	Compact *bool `yaml:"compact"`
 	// AttachMedia uploads image and video evidence to GitHub user-attachments
 	// when the PR body is rendered. It defaults on so default-config PRs stop
 	// citing local disk paths for screenshots; set false to opt out even when
@@ -1263,6 +1265,8 @@ type Test struct {
 // GitHub user-attachments at PR render time so remote reviewers can open them
 // without an evidence branch. Text artifacts stay inlined or locally cited.
 type Evidence struct {
+	// Compact defaults true; false opts into inline PR evidence previews.
+	Compact     bool
 	StoreInRepo bool
 	AttachMedia bool
 	Dir         string
@@ -3521,6 +3525,7 @@ func testDefaults() Test {
 	return Test{
 		Evidence: Evidence{
 			StoreInRepo: false,
+			Compact:     true,
 			AttachMedia: true,
 			Dir:         ".no-mistakes/evidence",
 			Branch:      evidence.DefaultBranch,
@@ -3539,6 +3544,9 @@ func testDefaults() Test {
 // The local-storage half is applied separately by applyEvidenceStorageOverrides
 // so a repository config can never reach it (see EvidenceRaw.LocalRoot).
 func applyTestOverrides(dst *Test, src *TestRaw) {
+	if src.Evidence.Compact != nil {
+		dst.Evidence.Compact = *src.Evidence.Compact
+	}
 	if src.Evidence.StoreInRepo != nil {
 		dst.Evidence.StoreInRepo = *src.Evidence.StoreInRepo
 	}

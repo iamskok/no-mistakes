@@ -349,15 +349,16 @@ func BuildTestingSummaryForPR(steps []*db.StepResult, rounds map[string][]*db.St
 }
 
 func BuildTestingSummaryForPRWithProvider(steps []*db.StepResult, rounds map[string][]*db.StepRound, upstreamURL, ref, repoRoot, evidenceRoot string, links *evidenceLinks, provider scm.Provider) string {
-	return buildPRTestingSummary(steps, rounds, upstreamURL, ref, repoRoot, evidenceRoot, links, provider, nil)
+	return buildPRTestingSummary(steps, rounds, upstreamURL, ref, repoRoot, evidenceRoot, links, provider, nil, true)
 }
 
-func buildPRTestingSummary(steps []*db.StepResult, rounds map[string][]*db.StepRound, upstreamURL, ref, repoRoot, evidenceRoot string, links *evidenceLinks, provider scm.Provider, attachments map[string]string) string {
+func buildPRTestingSummary(steps []*db.StepResult, rounds map[string][]*db.StepRound, upstreamURL, ref, repoRoot, evidenceRoot string, links *evidenceLinks, provider scm.Provider, attachments map[string]string, compact bool) string {
 	opts := testingSummaryOptionsForGitHub(upstreamURL, ref)
 	opts.flavor = prBodyFlavorFor(provider)
-	opts.compactArtifacts = true
-	opts.summaryParagraph = true
-	opts.omitOutcome = true
+	opts.compactArtifacts = compact
+	opts.summaryParagraph = compact
+	opts.omitOutcome = compact
+	opts.includeTestedDetails = !compact
 	opts.repoRoot = repoRoot
 	opts.evidenceRoot = evidenceRoot
 	opts.evidence = links
@@ -431,10 +432,9 @@ func buildTestingSummary(steps []*db.StepResult, rounds map[string][]*db.StepRou
 			if rendered == "" {
 				continue
 			}
-			// A compact block with an uploaded attachment always starts with
-			// it. GitHub plays a bare video URL inline only when the URL is a
-			// paragraph by itself, so the block gets a blank line on both sides.
-			attachment := opts.compactArtifacts && opts.attachmentURL(artifact) != ""
+			// GitHub plays a bare uploaded video URL inline only when it is
+			// a paragraph by itself, so attachment blocks get blank lines.
+			attachment := opts.attachmentURL(artifact) != ""
 			if needsArtifactBlockSeparator(previousArtifact, rendered) {
 				b.WriteString("\n")
 			} else if (attachment || previousAttachment) && !strings.HasSuffix(b.String(), "\n\n") {
@@ -703,15 +703,30 @@ func renderTestingArtifact(artifact types.TestArtifact, opts testingSummaryOptio
 	}
 
 	var b strings.Builder
-	if target != "" && isImageArtifact(artifact.Kind, target) {
+	// Keep an inspectable source before any preview, which may be truncated.
+	link := artifact.URL
+	if link == "" {
+		link = artifactLinkTargetForPath(artifact, opts)
+	}
+	if link == "" {
+		link = opts.attachmentURL(artifact)
+	}
+	if link != "" {
+		b.WriteString(fmt.Sprintf("- Evidence: [%s](%s)\n\n", html.EscapeString(label), link))
+	}
+	if attachment := opts.attachmentURL(artifact); attachment != "" {
+		b.WriteString(renderAttachmentMarkdown(artifact, attachment, label))
+	} else if target != "" && isImageArtifact(artifact.Kind, target) {
 		b.WriteString(fmt.Sprintf("**%s**\n\n![%s](%s)\n", html.EscapeString(label), markdownAltText(label), target))
 	} else if target != "" && isVideoArtifact(artifact.Kind, target) {
 		if opts.flavor == prBodyMarkdown {
-			b.WriteString(fmt.Sprintf("- Evidence: [%s](%s)\n", html.EscapeString(label), target))
+			if link == "" {
+				b.WriteString(fmt.Sprintf("- Evidence: [%s](%s)\n", html.EscapeString(label), target))
+			}
 		} else {
 			b.WriteString(fmt.Sprintf("**%s**\n\n<video src=\"%s\" controls></video>\n", html.EscapeString(label), html.EscapeString(target)))
 		}
-	} else if !hasFile {
+	} else if !hasFile && link == "" {
 		if target != "" {
 			b.WriteString(fmt.Sprintf("- Evidence: [%s](%s)\n", html.EscapeString(label), target))
 		} else if localPath != "" {

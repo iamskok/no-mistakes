@@ -76,7 +76,8 @@ type RunOpts struct {
 	// OnAttempt receives each concrete adapter attempt, including retries and
 	// fallback-provider attempts, after it completes. It is instrumentation
 	// only and must not change invocation behavior.
-	OnAttempt func(Attempt)
+	OnAttempt       func(Attempt)
+	ConfiguredModel string
 }
 
 // IsStructuredOutputRejected reports whether an invocation completed but its
@@ -126,6 +127,7 @@ func RejectStructuredOutput(err error) error {
 // invocation. An Agent may make several attempts when it retries transient
 // failures or moves to a fallback provider.
 type Attempt struct {
+	ConfiguredModel string
 	Agent           string
 	Result          *Result
 	Err             error

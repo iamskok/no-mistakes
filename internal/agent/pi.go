@@ -110,7 +110,7 @@ func (a *piAgent) runOnce(ctx context.Context, opts RunOpts, strict bool) (*Resu
 		err = errors.Join(err, piStdinError(<-stdinErrCh))
 		retErr := fmt.Errorf("pi parse events: %w", err)
 		emitAgentExited(opts, "pi", pid, retErr)
-		return failedResult(pp.usage, pp.sessionID), retErr
+		return pp.failedResult(), retErr
 	}
 
 	waitErr := started.wait()
@@ -121,24 +121,24 @@ func (a *piAgent) runOnce(ctx context.Context, opts RunOpts, strict bool) (*Resu
 		if stderr != "" {
 			retErr := fmt.Errorf("pi exited: %w: %s", errors.Join(waitErr, stdinErr), stderr)
 			emitAgentExited(opts, "pi", pid, retErr)
-			return failedResult(pp.usage, pp.sessionID), retErr
+			return pp.failedResult(), retErr
 		}
 		retErr := fmt.Errorf("pi exited: %w", errors.Join(waitErr, stdinErr))
 		emitAgentExited(opts, "pi", pid, retErr)
-		return failedResult(pp.usage, pp.sessionID), retErr
+		return pp.failedResult(), retErr
 	}
 	if stdinErr != nil {
 		if stderr != "" {
 			stdinErr = fmt.Errorf("%w: %s", stdinErr, stderr)
 		}
 		emitAgentExited(opts, "pi", pid, stdinErr)
-		return failedResult(pp.usage, pp.sessionID), stdinErr
+		return pp.failedResult(), stdinErr
 	}
 
 	if pp.assistantError != "" {
 		retErr := fmt.Errorf("pi reported error: %s", pp.assistantError)
 		emitAgentExited(opts, "pi", pid, retErr)
-		return failedResult(pp.usage, pp.sessionID), retErr
+		return pp.failedResult(), retErr
 	}
 
 	text := pp.finalText()
@@ -151,10 +151,13 @@ func (a *piAgent) runOnce(ctx context.Context, opts RunOpts, strict bool) (*Resu
 			}
 			retErr = RejectStructuredOutput(retErr)
 			emitAgentExited(opts, "pi", pid, retErr)
-			return failedResult(pp.usage, pp.sessionID), retErr
+			return pp.failedResult(), retErr
 		}
 	}
 	res, err := finalizeTextResult("pi", text, opts.JSONSchema, pp.usage)
+	if res == nil {
+		res = pp.failedResult()
+	}
 	if res != nil {
 		res.Model = pp.model
 		res.ModelProvider = pp.provider
@@ -180,6 +183,18 @@ func (a *piAgent) runOnce(ctx context.Context, opts RunOpts, strict bool) (*Resu
 	}
 	emitAgentExited(opts, "pi", pid, err)
 	return res, err
+}
+
+func (p *piParser) failedResult() *Result {
+	res := failedResult(p.usage, p.sessionID)
+	if res == nil && (p.model != "" || p.provider != "") {
+		res = &Result{}
+	}
+	if res != nil {
+		res.Model = p.model
+		res.ModelProvider = p.provider
+	}
+	return res
 }
 
 func piStdinError(err error) error {

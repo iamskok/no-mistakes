@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.102.1](https://github.com/kunchenguid/no-mistakes/compare/v1.102.0...v1.102.1) (2026-10-27)
+
+
+### Bug Fixes
+
+* **gate:** never rewrite another no-mistakes home's gate remote on init ([#1625](https://github.com/kunchenguid/no-mistakes/issues/1625)) ([9762fbd](https://github.com/kunchenguid/no-mistakes/commit/9762fbdfc808f7128782fdc4f61ab050f9fcb6b5))
+* **pipeline:** redact run worktree paths in the PR body ([#1623](https://github.com/kunchenguid/no-mistakes/issues/1623)) ([8f3bbe4](https://github.com/kunchenguid/no-mistakes/commit/8f3bbe4f8c6689fac50edace35cb539788c9897c))
+
 ## [1.102.0](https://github.com/kunchenguid/no-mistakes/compare/v1.101.0...v1.102.0) (2026-10-26)
 
 

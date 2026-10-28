@@ -332,9 +332,7 @@ func newPipelineAgent(ctx context.Context, cfg *config.Config, evidenceRoot stri
 		if !ok {
 			continue
 		}
-		roleConfig := cfg.ForReviewAgent(entry)
-		roleConfig.QuotaRouting.Enabled = false
-		next, _, err := newConfiguredAgent(ctx, roleConfig, evidenceRoot, lookPath, environment, nil)
+		next, err := newReviewRoleAgent(ctx, cfg, entry, evidenceRoot, lookPath, environment)
 		if err != nil {
 			_ = primary.Close()
 			for _, existing := range roles {
@@ -356,6 +354,28 @@ func newPipelineAgent(ctx context.Context, cfg *config.Config, evidenceRoot stri
 			LateFrom: cfg.ReviewAgentTakeoverRound(config.RoleFixerAfterRound),
 		},
 	}), record, nil
+}
+
+func newReviewRoleAgent(ctx context.Context, cfg *config.Config, entry config.ReviewAgent, evidenceRoot string, lookPath func(string) (string, error), environment runenv.Overlay) (agent.Agent, error) {
+	var created []agent.Agent
+	var models []string
+	for _, candidate := range append([]config.ReviewAgent{entry}, entry.Fallback...) {
+		roleConfig := cfg.ForReviewAgent(candidate)
+		roleConfig.QuotaRouting.Enabled = false
+		next, _, err := newConfiguredAgent(ctx, roleConfig, evidenceRoot, lookPath, environment, nil)
+		if err != nil {
+			for _, existing := range created {
+				_ = existing.Close()
+			}
+			return nil, err
+		}
+		created = append(created, next)
+		models = append(models, roleConfig.AgentProfileFor(candidate.Agent).Model)
+	}
+	if len(entry.Fallback) == 0 {
+		return created[0], nil
+	}
+	return agent.NewFallback(created, agent.WithReviewerQuotaFallback(models...)), nil
 }
 
 func newConfiguredAgent(ctx context.Context, cfg *config.Config, evidenceRoot string, lookPath func(string) (string, error), environment runenv.Overlay, quota *quotarouting.Record) (agent.Agent, *quotarouting.Record, error) {

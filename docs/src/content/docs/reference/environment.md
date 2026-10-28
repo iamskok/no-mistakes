@@ -306,7 +306,8 @@ Repository-declared [gate](/no-mistakes/reference/repo-config/#gates) labels sta
 
 Detailed performance evidence stays on the machine in the local state database (`<NM_HOME>/state.sqlite`): one `agent_invocations` row per agent invocation, plus each run's accumulated parked-at-gate time.
 Each row records run and step identity, purpose (such as review/review-fix/housekeeping), the reported model and its provider, the cold/started/resumed/fallback session mode, a truncated session-identity hash, timestamps, duration, exit status, and failure category, alongside the session-fidelity metrics below.
-It never stores prompts, model outputs, diffs, raw command arguments, secret values, or credentials - only bounded counts, low-cardinality categories, and durations.
+For an explicit [reviewer fallback chain](/no-mistakes/reference/global-config/#review_agents), each attempt also records `configured_model` when nonempty, including any configured provider prefix. This identifies the configured candidate separately from the adapter-reported model and provider, including on failed attempts. Native argument overrides can still take precedence, so this field does not prove which model served the request. Older rows and attempts without this metadata read back as NULL.
+It never stores prompts, model outputs, diffs, raw command arguments, secret values, or credentials.
 
 Token counts and the additive session-fidelity fields are nullable and read back as unknown (rendered `-`) rather than a fabricated zero when the adapter did not report them, so a failed or cancelled invocation, a row written before a field existed, and an adapter that does not surface a datum stay honest.
 A recorded `0` means the adapter reported zero; it is distinct from unknown.

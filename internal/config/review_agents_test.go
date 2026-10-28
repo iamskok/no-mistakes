@@ -38,8 +38,41 @@ func TestReviewAgentsRejectInvalidConfig(t *testing.T) {
 		"review_agents: {fixer: {agent: cursor, effort: max}}",
 		"review_agents: {fixer: {agent: rovodev, model: x}}",
 		"review_agents: {reviewer: {agent: pi, typo: x}}",
+		"review_agents: {fixer: {agent: pi, fallback: [{agent: codex}]}}",
+		"review_agents: {reviewer: {agent: pi, fallback: [{agent: auto}]}}",
+		"review_agents: {reviewer: {agent: pi, fallback: [{agent: codex, effort: turbo}]}}",
+		"review_agents: {reviewer: {agent: pi, fallback: [{agent: codex, after_round: 1}]}}",
+		"review_agents: {reviewer: {agent: pi, fallback: [{agent: codex, fallback: [{agent: pi}]}]}}",
 	} {
 		t.Run(input, func(t *testing.T) { loadGlobalConfigError(t, input) })
+	}
+}
+
+func TestReviewAgentFallbackProfilesStayOperatorOwned(t *testing.T) {
+	global := writeGlobalConfig(t, `agent: codex
+agent_config:
+  pi: {model: default-model, effort: high}
+review_agents:
+  reviewer:
+    agent: codex
+    fallback: [{agent: pi, model: reviewer-model}]
+`)
+	repo, err := LoadRepoFromBytes([]byte(`review_agents: {reviewer: {agent: pi, fallback: [{agent: pi, model: attacker-model}]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Merge(global, repo)
+	fallback := cfg.ForReviewAgent(cfg.ReviewAgents[RoleReviewer].Fallback[0])
+	if got := fallback.AgentProfile(); got != (agentcfg.Profile{Model: "reviewer-model", Effort: agentcfg.EffortHigh}) {
+		t.Fatalf("fallback profile = %+v", got)
+	}
+	if cfg.AgentProfileFor(types.AgentPi).Model != "default-model" {
+		t.Fatal("fallback mutated the shared profile")
+	}
+	if err := validatePiProfileAgents(types.AgentPi, nil, map[string]ReviewAgent{RoleReviewer: {
+		Agent: types.AgentPi, Fallback: []ReviewAgent{{Agent: types.AgentCodex}},
+	}}); err == nil {
+		t.Fatal("Pi run pin silently dropped a non-Pi fallback")
 	}
 }
 
