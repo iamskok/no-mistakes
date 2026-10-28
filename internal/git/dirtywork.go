@@ -9,6 +9,7 @@ import (
 	"hash/fnv"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1450,6 +1451,39 @@ func recheckDirtyWork(ctx context.Context, wt, tmp, head, indexTree, workTree, u
 			}
 		}
 	}
+	preserveAll := make(map[string]bool)
+	for path := range preserveTracked {
+		preserveAll[path] = true
+	}
+	if untrackedTree != "" {
+		paths, err := RunRaw(ctx, wt, "ls-tree", "-r", "--name-only", "-z", untrackedTree)
+		if err != nil {
+			return err
+		}
+		for _, path := range bytes.Split(paths, []byte{0}) {
+			if len(path) != 0 {
+				preserveAll[filepath.FromSlash(string(path))] = true
+			}
+		}
+	}
+	for path := range preserveAll {
+		if filepath.Base(path) != ".gitattributes" {
+			continue
+		}
+		if err := walkIndexBlobs(trackedBlobs, func(mode, path, sha string) error {
+			preserveTracked[path] = true
+			return nil
+		}); err != nil {
+			return err
+		}
+		if err := walkIndexBlobs(blobs, func(mode, path, sha string) error {
+			preserveAll[path] = true
+			return nil
+		}); err != nil {
+			return err
+		}
+		break
+	}
 	headTree, err := Run(ctx, wt, "rev-parse", "--verify", head+"^{tree}")
 	if err != nil {
 		return err
@@ -1465,19 +1499,6 @@ func recheckDirtyWork(ctx context.Context, wt, tmp, head, indexTree, workTree, u
 		}
 	}
 	if untrackedTree != "" {
-		preserveAll := make(map[string]bool)
-		for path := range preserveTracked {
-			preserveAll[path] = true
-		}
-		paths, err := RunRaw(ctx, wt, "ls-tree", "-r", "--name-only", "-z", untrackedTree)
-		if err != nil {
-			return err
-		}
-		for _, path := range bytes.Split(paths, []byte{0}) {
-			if len(path) != 0 {
-				preserveAll[filepath.FromSlash(string(path))] = true
-			}
-		}
 		if err := verifyRestoreConversions(ctx, wt, tmp, workTree, blobs, preserveAll, config); err != nil {
 			return err
 		}
@@ -1589,8 +1610,11 @@ func verifyRestoreConversions(ctx context.Context, wt, tmp, tree string, blobs [
 		return err
 	}
 	protected := make(map[string]bool)
-	for path := range paths {
+	if err := walkIndexBlobs(blobs, func(mode, path, sha string) error {
 		protected[path] = true
+		return nil
+	}); err != nil {
+		return err
 	}
 	if err := walkIndexBlobs(stageBlobs, func(mode, path, sha string) error {
 		if filepath.Base(path) != ".gitattributes" || (mode != "100644" && mode != "100755") {
@@ -1619,19 +1643,74 @@ func verifyRestoreConversions(ctx context.Context, wt, tmp, tree string, blobs [
 		input.WriteString(filepath.ToSlash(path))
 		input.WriteByte(0)
 	}
-	attrs, err := runInDirWithEnvAndInputRaw(ctx, root, env, input.String(), "check-attr", "--cached", "-z", "--stdin", "filter")
+	attrArgs := []string{"-z", "--stdin", "--all"}
+	cachedArgs := append([]string{"check-attr", "--cached"}, attrArgs...)
+	attrs, err := runInDirWithEnvAndInputRaw(ctx, root, env, input.String(), cachedArgs...)
 	if err != nil {
 		return err
 	}
-	fields := bytes.Split(bytes.TrimSuffix(attrs, []byte{0}), []byte{0})
-	if len(fields)%3 != 0 {
-		return fmt.Errorf("%w: unreadable restore attributes", ErrDirtyWorkRejected)
-	}
-	for i := 0; i < len(fields); i += 3 {
-		value := string(fields[i+2])
-		if value != "unspecified" && value != "unset" {
-			return fmt.Errorf("%w: external conversion for %s cannot be verified", ErrDirtyWorkRejected, fields[i])
+	parseRules := func(out []byte) (map[[2]string]string, error) {
+		rules := make(map[[2]string]string)
+		if len(out) == 0 {
+			return rules, nil
 		}
+		fields := bytes.Split(bytes.TrimSuffix(out, []byte{0}), []byte{0})
+		if len(fields)%3 != 0 {
+			return nil, fmt.Errorf("%w: unreadable restore attributes", ErrDirtyWorkRejected)
+		}
+		for i := 0; i < len(fields); i += 3 {
+			rules[[2]string{string(fields[i]), string(fields[i+1])}] = string(fields[i+2])
+		}
+		return rules, nil
+	}
+	cachedRules, err := parseRules(attrs)
+	if err != nil {
+		return err
+	}
+	for key, value := range cachedRules {
+		path := filepath.FromSlash(key[0])
+		if key[1] == "filter" && (paths[path] || filepath.Base(path) == ".gitattributes") && value != "unspecified" && value != "unset" {
+			return fmt.Errorf("%w: external conversion for %s cannot be verified", ErrDirtyWorkRejected, key[0])
+		}
+	}
+	convertedRoot, err := os.MkdirTemp(tmp, "checkout-attributes-")
+	if err != nil {
+		return err
+	}
+	if err := walkIndexBlobs(stageBlobs, func(mode, path, sha string) error {
+		if filepath.Base(path) != ".gitattributes" || (mode != "100644" && mode != "100755") {
+			return nil
+		}
+		full := filepath.Join(convertedRoot, path)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			return err
+		}
+		file, err := os.Create(full)
+		if err != nil {
+			return err
+		}
+		err = gitStreamTo(ctx, root, env, file, config.args("cat-file", "--filters", "--path="+filepath.ToSlash(path), sha)...)
+		closeErr := file.Close()
+		if err != nil {
+			return err
+		}
+		return closeErr
+	}); err != nil {
+		return err
+	}
+	root = convertedRoot
+	env = append(env, "GIT_WORK_TREE="+root)
+	checkoutArgs := append([]string{"check-attr"}, attrArgs...)
+	checkoutAttrs, err := runInDirWithEnvAndInputRaw(ctx, root, env, input.String(), checkoutArgs...)
+	if err != nil {
+		return err
+	}
+	checkoutRules, err := parseRules(checkoutAttrs)
+	if err != nil {
+		return err
+	}
+	if !maps.Equal(cachedRules, checkoutRules) {
+		return fmt.Errorf("%w: checked-out attributes change conversion rules", ErrDirtyWorkRejected)
 	}
 	check := func(mode, path, sha, expectedPath string) error {
 		if mode == "120000" || mode == "160000" {
