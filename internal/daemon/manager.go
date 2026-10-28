@@ -1532,7 +1532,13 @@ func (m *RunManager) withBranchLock(repoID, branch string, action func() (string
 // and retry is nil for every run that does not continue a failed one.
 func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, intent, source, launchNonce, validationGeneration, intentDigest, prBaseBranch string, omitIntent bool, inheritedPRURL, planID string, closingIssues []string, retry *retryLaunch, profiles ...*agentcfg.PiProfile) (string, error) {
 	sequence := m.reserveAdmission()
-	defer m.releaseAdmission(sequence)
+	var cleanupSetupWorktree func()
+	defer func() {
+		m.releaseAdmission(sequence)
+		if cleanupSetupWorktree != nil {
+			cleanupSetupWorktree()
+		}
+	}()
 	branchRole := telemetryBranchRole(branch, repo.DefaultBranch)
 	trackStartFailure := func(stage string) {
 		telemetry.Track("run", telemetry.Fields{
@@ -1694,16 +1700,13 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 	}
 
 	// The worktree exists from here on, so cleanup ownership is armed from here
-	// on: every later setup failure returns through this defer, and the
+	// on: every later setup failure returns through the deferred cleanup, and the
 	// background goroutine takes ownership only once it is running. Setup
 	// failures still attempt capture and cleanup; preservation refusals keep
 	// real checkouts in their recorded placement.
-	bgOwnsWorktree := false
-	defer func() {
-		if !bgOwnsWorktree {
-			m.removeRunWorktree(context.Background(), repo.ID, run.ID, gateDir, wtDir, "run_setup_failed")
-		}
-	}()
+	cleanupSetupWorktree = func() {
+		m.removeRunWorktree(context.Background(), repo.ID, run.ID, gateDir, wtDir, "run_setup_failed")
+	}
 
 	if err := git.CopyLocalUserIdentity(ctx, repo.WorkingPath, wtDir); err != nil {
 		m.db.UpdateRunError(run.ID, fmt.Sprintf("configure worktree git identity: %s", err))
@@ -1988,7 +1991,7 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 		}()
 	}
 
-	bgOwnsWorktree = true
+	cleanupSetupWorktree = nil
 	m.admitRun(sequence, queuedRun{
 		runID: run.ID, repoID: repo.ID, branch: branch,
 		gateDir: gateDir, wtDir: wtDir,
