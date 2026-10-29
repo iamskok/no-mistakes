@@ -107,6 +107,8 @@ Capture and verification scratch becomes eligible for reclamation after its owni
 
 For restoration, read `restore-core-autocrlf` and `restore-core-eol` from `git show -s --format=%B <snapshot-commit>`. These record the capture's line-ending settings, including checkout-specific overrides; native line endings are recorded as `lf` or `crlf`. Substitute those saved values in **both** commands below. Creating the replacement checkout with them avoids inheriting different line endings after the original worktree's configuration is deleted.
 
+On Windows without symlink creation support, omit `-c core.symlinks=true` from both commands. That Windows procedure does not support symlink restoration.
+
 ```sh
 git -c core.symlinks=true -c core.autocrlf=<restore-core-autocrlf> -c core.eol=<restore-core-eol> worktree add --detach <path> <snapshot-commit>^1
 git -C <path> -c core.symlinks=true -c core.autocrlf=<restore-core-autocrlf> -c core.eol=<restore-core-eol> -c apply.whitespace=nowarn stash apply --index <snapshot-commit>

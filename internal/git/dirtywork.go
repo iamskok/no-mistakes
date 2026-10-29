@@ -1284,7 +1284,7 @@ func writeUntrackedTree(ctx context.Context, wt, tmp string, prepared []prepared
 		return "", err
 	}
 	if info != "" {
-		if _, err := runInDirWithEnvAndInput(ctx, wt, env, info, "update-index", "--index-info"); err != nil {
+		if _, err := runInDirWithEnvAndInput(ctx, wt, env, info, "update-index", "-z", "--index-info"); err != nil {
 			return "", fmt.Errorf("record untracked files: %w", err)
 		}
 	}
@@ -1315,7 +1315,7 @@ func buildWorkTree(ctx context.Context, wt, tmp, indexCopy string, prepared []pr
 		return "", err
 	}
 	if info != "" {
-		if _, err := runInDirWithEnvAndInput(ctx, wt, env, info, "update-index", "--index-info"); err != nil {
+		if _, err := runInDirWithEnvAndInput(ctx, wt, env, info, "update-index", "-z", "--index-info"); err != nil {
 			return "", fmt.Errorf("snapshot tracked worktree: %w", err)
 		}
 	}
@@ -1360,7 +1360,7 @@ func indexInfo(ctx context.Context, wt string, prepared []preparedEntry, include
 		if err != nil {
 			return "", fmt.Errorf("hash %s: %w", path.rel, err)
 		}
-		fmt.Fprintf(&info, "%s %s\t%s\n", path.mode, blob, filepath.ToSlash(path.rel))
+		fmt.Fprintf(&info, "%s %s\t%s\x00", path.mode, blob, filepath.ToSlash(path.rel))
 	}
 	return info.String(), nil
 }
