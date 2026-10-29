@@ -321,10 +321,9 @@ func protectedPIDs(byPID map[int]Process) map[int]bool {
 // so a single spelling is not enough to recognise our own tree.
 //
 // The canonical form resolves symlinks through the deepest ancestor that still
-// exists (see worktrees.Canonical), which matters because the directory named
-// here is often gone: a run worktree is removed at run end while a process that
-// escaped its process group keeps standing in it, and that deleted cwd is the
-// whole reason this package exists. Resolving only paths that still exist would
+// exists (see worktrees.Canonical), because the directory named here may already
+// be gone. A process that escaped its process group can keep a deleted worktree
+// as its cwd. Resolving only paths that still exist would
 // leave such a process unreachable whenever any component of its path is a
 // symlink - which on macOS includes anything under /tmp.
 func pathPrefixes(dir string) []string {
