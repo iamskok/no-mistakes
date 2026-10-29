@@ -64,6 +64,36 @@ func TestRemoveAllRemovesTreesAndMissingPaths(t *testing.T) {
 	}
 }
 
+func TestRemoveAllIfSameRequiresOwnedIdentity(t *testing.T) {
+	path := t.TempDir()
+	file := filepath.Join(path, "unique.txt")
+	if err := os.WriteFile(file, []byte("retained bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	owned, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unrelated, err := os.Stat(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []os.FileInfo{nil, unrelated} {
+		if err := RemoveAllIfSame(context.Background(), path, expected); !errors.Is(err, os.ErrInvalid) {
+			t.Fatalf("unproven removal = %v, want refusal", err)
+		}
+		if got, err := os.ReadFile(file); err != nil || string(got) != "retained bytes" {
+			t.Fatalf("unproven removal changed bytes: %q, %v", got, err)
+		}
+	}
+	if err := RemoveAllIfSame(context.Background(), path, owned); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(file); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("owned removal did not remove the tree: %v", err)
+	}
+}
+
 func TestRemoveAllDoesNotFollowSymlinks(t *testing.T) {
 	for _, topLevel := range []bool{true, false} {
 		name := "nested"

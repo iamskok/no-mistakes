@@ -122,6 +122,12 @@ func TestFinishedCleanupSharesOneBudgetAcrossOwnAndRetainedCheckouts(t *testing.
 	first := f.checkout(t, false)
 	second := f.checkout(t, false)
 	third := f.checkout(t, false)
+	storageFiles := seedCleanupDiagnostics(t, f, first.runID, false)
+	active, err := f.d.InsertRun(first.repoID, "feature/active", f.head, f.head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeFiles := seedCleanupDiagnostics(t, f, active.ID, false)
 	old := time.Now().Add(-2 * time.Hour)
 	if err := os.Chtimes(second.dir, old, old); err != nil {
 		t.Fatal(err)
@@ -146,6 +152,8 @@ func TestFinishedCleanupSharesOneBudgetAcrossOwnAndRetainedCheckouts(t *testing.
 		}
 	})
 	waitForStartupCleanupFilter(t, f.entered(first), done)
+	assertCleanupDiagnostics(t, storageFiles, false)
+	assertCleanupDiagnostics(t, activeFiles, true)
 	if delay := time.Until(started.Add(finishedRunCleanupTimeout / 2)); delay > 0 {
 		time.Sleep(delay)
 	}
@@ -163,4 +171,6 @@ func TestFinishedCleanupSharesOneBudgetAcrossOwnAndRetainedCheckouts(t *testing.
 	for _, wt := range []orphanWorktree{first, second, third} {
 		assertStartupCheckoutRetained(t, wt)
 	}
+	assertCleanupDiagnostics(t, storageFiles, false)
+	assertCleanupDiagnostics(t, activeFiles, true)
 }

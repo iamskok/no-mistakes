@@ -151,6 +151,47 @@ func assertStartupCheckoutRetained(t *testing.T, wt orphanWorktree) {
 	}
 }
 
+func seedCleanupDiagnostics(t *testing.T, f *startupCleanupFixture, runID string, legacy bool) []string {
+	t.Helper()
+	files := []string{
+		filepath.Join(f.p.EvidenceDir(), runID, "proof.log"),
+		filepath.Join(f.p.RunLogDir(runID), "proof.log"),
+	}
+	if legacy {
+		files = append(files, filepath.Join(os.TempDir(), legacyEvidenceDirName, runID, "proof.log"))
+	}
+	stale := time.Now().Add(-60 * 24 * time.Hour)
+	for _, file := range files {
+		if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(file, []byte("diagnostic fixture bytes"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(file, stale, stale); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(filepath.Dir(file), stale, stale); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return files
+}
+
+func assertCleanupDiagnostics(t *testing.T, files []string, retained bool) {
+	t.Helper()
+	for _, file := range files {
+		got, err := os.ReadFile(file)
+		if retained {
+			if err != nil || string(got) != "diagnostic fixture bytes" {
+				t.Fatalf("active diagnostics changed: %q, %v", got, err)
+			}
+		} else if !os.IsNotExist(err) {
+			t.Fatalf("expired diagnostics survived before blocking capture: %v", err)
+		}
+	}
+}
+
 func TestStartupCleanupCancellationReachesCaptureAndConfirmation(t *testing.T) {
 	for _, phase := range []string{"default", "recorded", "confirmation"} {
 		t.Run(phase, func(t *testing.T) {
@@ -203,26 +244,12 @@ func TestStartupCleanupSharesOneBudgetAcrossCandidatesAndSweeps(t *testing.T) {
 	first := f.checkout(t, false)
 	second := f.checkout(t, false)
 	recorded := f.checkout(t, true)
-	storageFiles := []string{
-		filepath.Join(f.p.EvidenceDir(), first.runID, "proof.log"),
-		filepath.Join(f.p.RunLogDir(first.runID), "proof.log"),
-		filepath.Join(os.TempDir(), legacyEvidenceDirName, first.runID, "proof.log"),
+	storageFiles := seedCleanupDiagnostics(t, f, first.runID, true)
+	active, err := f.d.InsertRun(first.repoID, "feature/active", f.head, f.head)
+	if err != nil {
+		t.Fatal(err)
 	}
-	stale := time.Now().Add(-60 * 24 * time.Hour)
-	for _, file := range storageFiles {
-		if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(file, []byte("retained storage bytes"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Chtimes(file, stale, stale); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Chtimes(filepath.Dir(file), stale, stale); err != nil {
-			t.Fatal(err)
-		}
-	}
+	activeFiles := seedCleanupDiagnostics(t, f, active.ID, true)
 	old := time.Now().Add(-2 * time.Hour)
 	if err := os.Chtimes(first.dir, old, old); err != nil {
 		t.Fatal(err)
@@ -247,6 +274,8 @@ func TestStartupCleanupSharesOneBudgetAcrossCandidatesAndSweeps(t *testing.T) {
 		}
 	})
 	waitForStartupCleanupFilter(t, f.entered(first), done)
+	assertCleanupDiagnostics(t, storageFiles, false)
+	assertCleanupDiagnostics(t, activeFiles, true)
 	if delay := time.Until(started.Add(startupCleanupTimeout / 2)); delay > 0 {
 		time.Sleep(delay)
 	}
@@ -264,9 +293,6 @@ func TestStartupCleanupSharesOneBudgetAcrossCandidatesAndSweeps(t *testing.T) {
 	for _, wt := range []orphanWorktree{first, second, recorded} {
 		assertStartupCheckoutRetained(t, wt)
 	}
-	for _, file := range storageFiles {
-		if got, err := os.ReadFile(file); err != nil || string(got) != "retained storage bytes" {
-			t.Fatalf("later storage cleanup restarted the exhausted budget: %v", err)
-		}
-	}
+	assertCleanupDiagnostics(t, storageFiles, false)
+	assertCleanupDiagnostics(t, activeFiles, true)
 }

@@ -794,10 +794,6 @@ const startupCleanupTimeout = 10 * time.Second
 func cleanupStartupStorage(ctx context.Context, d *db.DB, p *paths.Paths, global *config.GlobalConfig, policy worktreeReapPolicy, now time.Time, leftover []db.RunWorktree) {
 	ctx, cancel := context.WithTimeout(ctx, startupCleanupTimeout)
 	defer cancel()
-	worktreeStarted := time.Now()
-	reapWorktrees(ctx, d, p, policy, now)
-	cleanupOrphanWorktrees(ctx, d, p, leftover)
-	logStartupPhase("worktree_cleanup", worktreeStarted)
 	evidenceStarted := time.Now()
 	evidencePolicy := evidenceReapPolicyFor(global)
 	root := evidenceRootFor(p, global)
@@ -805,6 +801,13 @@ func cleanupStartupStorage(ctx context.Context, d *db.DB, p *paths.Paths, global
 	reapLegacyEvidence(ctx, d, root, evidencePolicy, now)
 	reapRunLogs(ctx, d, p.LogsDir(), evidencePolicy, now)
 	logStartupPhase("evidence_cleanup", evidenceStarted)
+	if err := git.ReapDirtyWorkScratch(ctx); err != nil && ctx.Err() == nil {
+		slog.Debug("capture scratch retained", "error", err)
+	}
+	worktreeStarted := time.Now()
+	reapWorktrees(ctx, d, p, policy, now)
+	cleanupOrphanWorktrees(ctx, d, p, leftover)
+	logStartupPhase("worktree_cleanup", worktreeStarted)
 	if err := ctx.Err(); err != nil {
 		slog.Warn("startup storage cleanup stopped; unfinished directories retained", "error", err)
 	}

@@ -11,6 +11,17 @@ import (
 )
 
 func RemoveAll(ctx context.Context, path string) error {
+	return removeAll(ctx, path, nil)
+}
+
+func RemoveAllIfSame(ctx context.Context, path string, expected os.FileInfo) error {
+	if expected == nil {
+		return fs.ErrInvalid
+	}
+	return removeAll(ctx, path, expected)
+}
+
+func removeAll(ctx context.Context, path string, expected os.FileInfo) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -27,10 +38,10 @@ func RemoveAll(ctx context.Context, path string) error {
 		return err
 	}
 	defer parent.Close()
-	return removeEntry(ctx, parent, name)
+	return removeEntry(ctx, parent, name, expected)
 }
 
-func removeEntry(ctx context.Context, parent *os.Root, name string) error {
+func removeEntry(ctx context.Context, parent *os.Root, name string, expected os.FileInfo) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -40,6 +51,9 @@ func removeEntry(ctx context.Context, parent *os.Root, name string) error {
 	}
 	if err != nil {
 		return err
+	}
+	if expected != nil && !os.SameFile(info, expected) {
+		return fmt.Errorf("directory identity changed: %s: %w", name, fs.ErrInvalid)
 	}
 	if info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
 		child, err := parent.OpenRoot(name)
@@ -55,7 +69,7 @@ func removeEntry(ctx context.Context, parent *os.Root, name string) error {
 			if err != nil {
 				return err
 			}
-			return fmt.Errorf("directory changed during cleanup: %s", name)
+			return fmt.Errorf("directory changed during cleanup: %s: %w", name, fs.ErrInvalid)
 		}
 		err = removeContents(ctx, child)
 		closeErr := child.Close()
@@ -68,6 +82,16 @@ func removeEntry(ctx context.Context, parent *os.Root, name string) error {
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	current, err := parent.Lstat(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(info, current) {
+		return fmt.Errorf("entry changed during cleanup: %s: %w", name, fs.ErrInvalid)
 	}
 	err = parent.Remove(name)
 	if errors.Is(err, os.ErrNotExist) {
@@ -91,7 +115,7 @@ func removeContents(ctx context.Context, root *os.Root) error {
 		}
 		entries, readErr := dir.ReadDir(128)
 		for _, entry := range entries {
-			if err := removeEntry(ctx, root, entry.Name()); err != nil {
+			if err := removeEntry(ctx, root, entry.Name(), nil); err != nil {
 				return err
 			}
 		}

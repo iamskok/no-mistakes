@@ -16,7 +16,6 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/kunchenguid/no-mistakes/internal/fsutil"
 	"github.com/kunchenguid/no-mistakes/internal/safeurl"
 	"github.com/kunchenguid/no-mistakes/internal/shellenv"
 	"github.com/kunchenguid/no-mistakes/internal/winproc"
@@ -161,11 +160,12 @@ func DirtyWorkStillMatches(ctx context.Context, worktree string, snap *DirtyWork
 	if err != nil {
 		return err
 	}
-	tmp, err := os.MkdirTemp("", "nm-dirty-work-")
+	scratch, err := newDirtyWorkScratch(ctx)
 	if err != nil {
 		return err
 	}
-	defer fsutil.RemoveAll(ctx, tmp)
+	defer scratch.close(ctx)
+	tmp := scratch.path
 	return recheckDirtyWork(ctx, worktree, tmp, head, indexTree, workTree, untrackedTree, config, nil)
 }
 
@@ -1110,11 +1110,12 @@ func writeDirtySnapshot(ctx context.Context, req DirtyWorkRequest, ref string, e
 	if err != nil {
 		return nil, fmt.Errorf("read checkout head: %w", err)
 	}
-	tmp, err := os.MkdirTemp("", "nm-dirty-work-")
+	scratch, err := newDirtyWorkScratch(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer fsutil.RemoveAll(ctx, tmp)
+	defer scratch.close(ctx)
+	tmp := scratch.path
 
 	prepared, err := prepareDirtyContent(ctx, wt, tmp, entries)
 	if err != nil {
@@ -1958,11 +1959,12 @@ func assertCheckoutClean(ctx context.Context, wt string, observed map[string]os.
 	if err != nil {
 		return err
 	}
-	tmp, err := os.MkdirTemp("", "nm-dirty-work-")
+	scratch, err := newDirtyWorkScratch(ctx)
 	if err != nil {
 		return err
 	}
-	defer fsutil.RemoveAll(ctx, tmp)
+	defer scratch.close(ctx)
+	tmp := scratch.path
 	return recheckDirtyWork(ctx, wt, tmp, head, tree, tree, "", config, observed)
 }
 

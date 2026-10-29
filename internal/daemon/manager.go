@@ -685,16 +685,17 @@ const finishedRunCleanupTimeout = 10 * time.Second
 func (m *RunManager) cleanupFinishedRun(cfg *config.Config, repoID, runID, gateDir, wtDir, reason string) {
 	ctx, cancel := context.WithTimeout(context.Background(), finishedRunCleanupTimeout)
 	defer cancel()
-	m.removeRunWorktree(ctx, repoID, runID, gateDir, wtDir, reason)
 	m.cleanupRunEvidence(ctx, cfg, runID)
+	m.removeRunWorktree(ctx, repoID, runID, gateDir, wtDir, reason)
+	m.cleanupRunWorktrees(ctx, cfg)
 	if err := ctx.Err(); err != nil {
 		slog.Warn("finished-run cleanup stopped; unfinished checkouts retained", "run_id", runID, "error", err)
 	}
 }
 
 // cleanupRunEvidence tidies up after one finished run, then attempts retention
-// sweeps of evidence, step logs (see reapRunLogs), and leftover run worktrees
-// (see reapWorktrees), subject to ctx's shared cleanup deadline.
+// sweeps of evidence and step logs (see reapRunLogs), subject to ctx's shared
+// cleanup deadline.
 //
 // The per-run half is deliberately os.Remove and not os.RemoveAll: it succeeds
 // only when the directory is empty, so a run that produced no artifact leaves
@@ -716,19 +717,11 @@ func (m *RunManager) cleanupRunEvidence(ctx context.Context, cfg *config.Config,
 		Retention: config.DefaultEvidenceRetention,
 		MaxRuns:   config.DefaultEvidenceMaxRuns,
 	}
-	wtPolicy := worktreeReapPolicy{
-		Retention: config.DefaultWorktreeRetention,
-		MaxRuns:   config.DefaultWorktreeMaxRuns,
-	}
 	if cfg != nil {
 		configured = cfg.Test.Evidence.LocalRoot
 		policy = evidenceReapPolicy{
 			Retention: cfg.Test.Evidence.Retention,
 			MaxRuns:   cfg.Test.Evidence.MaxRuns,
-		}
-		wtPolicy = worktreeReapPolicy{
-			Retention: cfg.Worktree.Retention,
-			MaxRuns:   cfg.Worktree.MaxRuns,
 		}
 	}
 	root := m.paths.EvidenceRoot(configured)
@@ -737,8 +730,21 @@ func (m *RunManager) cleanupRunEvidence(ctx context.Context, cfg *config.Config,
 	}
 	now := time.Now()
 	reapEvidence(ctx, m.db, root, policy, now)
-	reapWorktrees(ctx, m.db, m.paths, wtPolicy, now)
 	reapRunLogs(ctx, m.db, m.paths.LogsDir(), policy, now)
+	if err := git.ReapDirtyWorkScratch(ctx); err != nil && ctx.Err() == nil {
+		slog.Debug("capture scratch retained", "error", err)
+	}
+}
+
+func (m *RunManager) cleanupRunWorktrees(ctx context.Context, cfg *config.Config) {
+	policy := worktreeReapPolicy{
+		Retention: config.DefaultWorktreeRetention,
+		MaxRuns:   config.DefaultWorktreeMaxRuns,
+	}
+	if cfg != nil {
+		policy = worktreeReapPolicy{Retention: cfg.Worktree.Retention, MaxRuns: cfg.Worktree.MaxRuns}
+	}
+	reapWorktrees(ctx, m.db, m.paths, policy, time.Now())
 }
 
 // removeRunWorktree sweeps processes before deciding whether to remove the
