@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"slices"
@@ -116,6 +117,7 @@ func (m *RunManager) pumpQueue() {
 		m.executors[next.runID] = next.executor
 		m.cancels[next.runID] = next.cancel
 		m.dones[next.runID] = next.done
+		m.ciWakes[next.runID] = make(chan struct{}, 1)
 		slog.Info("starting admitted run", "run_id", next.runID, "branch", next.branch)
 		next.spawn()
 	}
@@ -128,6 +130,9 @@ func (m *RunManager) releaseExecutionSlot(runID string) {
 	delete(m.executors, runID)
 	delete(m.cancels, runID)
 	delete(m.dones, runID)
+	m.resolveHandoffRequestLocked(runID, errors.New("run ended before handoff"))
+	delete(m.ciWakes, runID)
+	delete(m.ciMonitorActive, runID)
 	m.mu.Unlock()
 	m.pumpQueue()
 }
