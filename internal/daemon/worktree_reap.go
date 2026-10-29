@@ -43,7 +43,7 @@ func worktreeReapPolicyFor(global *config.GlobalConfig) worktreeReapPolicy {
 // reapWorktrees attempts cleanup of selected leftover directories under the
 // default <NM_HOME>/worktrees tree (issue #1093).
 //
-// It runs after each finished run (RunManager.cleanupRunEvidence) and at
+// It runs after each finished run (RunManager.cleanupRunWorktrees) and at
 // startup. Both paths retain real checkouts, even when clean or successfully
 // snapshotted, because stability through removal is unproven. Age and count
 // budgets therefore cannot ensure reclamation until a separate stability
