@@ -62,9 +62,10 @@ func DirtyWorkRef(runID string) string {
 }
 
 // CaptureDirtyWork snapshots staged changes, unstaged changes, and untracked
-// files that are not ignored. A clean checkout returns a nil snapshot and a
-// nil error. The snapshot ref is created only after the trees match the
-// checkout; any error, including cancellation, means the checkout must stay.
+// files that are not ignored. A clean checkout returns a nil snapshot with no
+// error only after its verification checks pass. The snapshot ref is created
+// only after the trees match the checkout; any error, including cancellation,
+// means the checkout must stay.
 // Secret-bearing paths and paths that resolve outside the checkout are
 // refused before any of their bytes are written into the object store.
 // Symlinks are stored as their link text. Sockets, fifos, and devices are
