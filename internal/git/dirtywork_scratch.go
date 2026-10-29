@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/kunchenguid/no-mistakes/internal/fsutil"
@@ -29,7 +30,15 @@ func newDirtyWorkScratch(ctx context.Context) (*dirtyWorkScratch, error) {
 	if err != nil {
 		return nil, err
 	}
-	root, err := os.OpenRoot(path)
+	// Open through the parent so the identity handle permits rename/removal
+	// on Windows while remaining open throughout ownership verification.
+	parent, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil {
+		_ = fsutil.RemoveAll(ctx, path)
+		return nil, err
+	}
+	root, err := parent.OpenRoot(filepath.Base(path))
+	_ = parent.Close()
 	if err != nil {
 		_ = fsutil.RemoveAll(ctx, path)
 		return nil, err

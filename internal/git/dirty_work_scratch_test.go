@@ -117,7 +117,12 @@ func TestReapDirtyWorkScratchPreservesActiveAndUnownedDirectories(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer active.close(context.Background())
+	t.Cleanup(func() {
+		active.close(context.Background())
+		if _, err := os.Stat(active.path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("completed scratch survived reclamation: %v", err)
+		}
+	})
 	unowned := filepath.Join(root, "nm-dirty-work-unrecorded")
 	if err := os.Mkdir(unowned, 0o700); err != nil {
 		t.Fatal(err)
