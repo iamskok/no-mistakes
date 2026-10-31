@@ -9,7 +9,7 @@ Build, test, and release commands are owned by the `Makefile`; read it for the f
 Safest local verification sequence after non-trivial changes:
 
 - `gofmt -w .`
-- `make lint` (generated-skill drift check plus `go vet`)
+- `make lint` (generated-skill and Windows-resource drift checks plus `go vet`)
 - `go test -race ./...` (the e2e suite is behind the `e2e` build tag and excluded)
 - `make e2e` when touching agent integrations, the e2e harness, or recorded fixtures
 - `go build -o ./bin/no-mistakes ./cmd/no-mistakes`

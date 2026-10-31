@@ -181,6 +181,33 @@ func (h *Host) Available(ctx context.Context) error {
 	return nil
 }
 
+// parseMergeRequestURL accepts a separate web host only when the operator's
+// global glab configuration binds it to this remote's host. --global excludes
+// repository-local configuration; the MR response itself is never authority for
+// an alternate host. Use the command factory so forge-profile environments apply.
+func (h *Host) parseMergeRequestURL(ctx context.Context, raw string) (int, error) {
+	number, err := parseMergeRequestURL(raw, h.host, h.projectPath)
+	if err == nil || h.host == "" {
+		return number, err
+	}
+	parsed, parseErr := url.Parse(strings.TrimSpace(raw))
+	if parseErr != nil || parsed.Hostname() == "" || strings.EqualFold(parsed.Hostname(), h.host) {
+		return 0, err
+	}
+	out, configErr := h.cmd(ctx, "glab", "config", "get", "api_host", "--host", h.host, "--global").Output()
+	if configErr != nil {
+		return 0, fmt.Errorf("%w (cannot read global glab api_host: %v)", err, configErr)
+	}
+	// api_host is a host[:port], not a URL or a path. Reject malformed or
+	// empty output rather than allowing the parser's legacy unscoped mode.
+	apiHost := strings.TrimSpace(string(out))
+	configured, configErr := url.Parse("https://" + apiHost)
+	if configErr != nil || apiHost == "" || strings.ContainsAny(apiHost, "/?#@\\\t\r\n ") || configured.Hostname() == "" {
+		return 0, fmt.Errorf("%w (invalid global glab api_host)", err)
+	}
+	return parseMergeRequestURL(raw, configured.Hostname(), h.projectPath)
+}
+
 func parseMergeRequestURL(raw, expectedHost, expectedProject string) (int, error) {
 	trimmed := strings.TrimSpace(raw)
 	parsed, err := url.Parse(trimmed)
@@ -395,7 +422,7 @@ func (h *Host) FindPR(ctx context.Context, branch, base string) (*scm.PR, error)
 		if url == "" {
 			return nil, fmt.Errorf("parse glab mr list JSON: entry %d missing merge request URL", i)
 		}
-		number, err := parseMergeRequestURL(url, h.host, h.projectPath)
+		number, err := h.parseMergeRequestURL(ctx, url)
 		if err != nil {
 			return nil, fmt.Errorf("parse glab mr list JSON: entry %d invalid merge request URL: %w", i, err)
 		}

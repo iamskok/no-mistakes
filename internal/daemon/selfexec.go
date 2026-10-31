@@ -175,7 +175,7 @@ func reinstallManagedServiceIfChanged(p *paths.Paths, beforeRestart func() error
 	}
 
 	existing, readErr := os.ReadFile(installPath)
-	// Inherit any proxy already baked into the existing definition so an
+	// Inherit proxy and telemetry values already baked into the definition so an
 	// env-less `daemon start` does not render a no-proxy target, falsely detect
 	// drift, and reinstall - which would strip the proxy and re-break the daemon
 	// with "403 Request not allowed". This mirrors the executable inheritance
@@ -195,10 +195,7 @@ func reinstallManagedServiceIfChanged(p *paths.Paths, beforeRestart func() error
 			inheritedProxyEnv = systemdUnitProxyEnv(existing)
 		}
 	}
-	proxyEnv := serviceProxyEnv()
-	if len(proxyEnv) == 0 {
-		proxyEnv = inheritedProxyEnv
-	}
+	proxyEnv := serviceEnv(inheritedProxyEnv)
 	switch runtimeGOOS {
 	case "darwin":
 		wanted = renderLaunchAgentWithProxyEnv(renderedExecutable, p, home, proxyEnv)

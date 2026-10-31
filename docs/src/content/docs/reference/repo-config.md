@@ -116,6 +116,7 @@ test:
   evidence:
     store_in_repo: true
     attach_media: true
+    compact: true
     dir: .no-mistakes/evidence
     branch: no-mistakes/evidence
     commit_message: "no-mistakes: evidence for {{.Branch}} (run {{.RunID}})"
@@ -505,9 +506,10 @@ Prose changes only. Do not request test coverage.
 
 `path` uses the same matcher and syntax as [`ignore_patterns`](#ignore_patterns), including the rule that `*` never crosses a `/`, so `**/*.go` covers a single directory level rather than every Go file.
 
-The review step appends only the blocks whose `path` matches at least one changed file, in the order they appear in the file.
+The review step appends blocks in configured order when at least one matched file remains in the review scope defined below.
 Two entries with the same `path` **and** the same `instructions` are injected once. The same instruction text under two different `path` values is injected once per path, because each block states its own scope. Two entries with the same `path` and different `instructions` are both injected.
 Matching runs against the full changed-file list and is deliberately **not** filtered by `ignore_patterns`: that field is read from the pushed branch, so filtering here would let a contributor drop one of your rules from the review of their own branch.
+Paths matched by repository or machine-local rules remain required review coverage even when the pushed branch ignores them, unless the trusted default branch's own `ignore_patterns` also excludes them. A path excluded only by the trusted copy remains reviewable if the pushed copy includes it. Each rendered block lists only its paths in that settled review scope, and a block with no remaining paths is omitted. Review takes the empty-scope shortcut only when neither non-ignored changes nor required instruction-covered paths remain.
 
 Blocks augment the built-in review instructions; they cannot disable them, and a finding the reviewer raises from a block goes through the same severity and action model as any other finding.
 With nothing configured, or nothing matching the change, the review prompt is exactly what it would be without this setting.
@@ -632,7 +634,7 @@ Do not rely on a configured command to leave a background server or watcher runn
 
 ### ignore_patterns
 
-Paths to exclude from review and documentation checks.
+Paths to exclude from review and documentation checks. Review also enforces the instruction-covered paths described under [`review.path_instructions`](#reviewpath_instructions).
 
 | | |
 | --- | --- |
@@ -985,7 +987,7 @@ A value set here wins over the operator's own [`ci.carry_review_on_replay`](/no-
 
 ### ci.release_after_checks_pass
 
-Whether the CI step finishes the run at its checks verdict instead of monitoring the pull request until it is merged or closed.
+Whether the CI step finishes the run at its checks verdict instead of monitoring the pull request until it is merged, closed, declined, or handed off.
 
 | | |
 |---|---|
@@ -998,7 +1000,7 @@ ci:
   release_after_checks_pass: true
 ```
 
-- **`false` (default)** is what the step has always done: once every check is green the run records readiness and keeps watching the PR until it is merged, closed, or declined, and a later base-branch advance or conflict is still repaired on its own.
+- **`false` (default)** is what the step has always done: once every check is green the run records readiness and keeps watching the PR until it is merged, closed, or declined, unless an operator explicitly hands off the green monitor; a later base-branch advance or conflict is still repaired on its own.
 - **`true`** finishes the step at that point. The run completes with the `checks_passed` status, releases its worktree, and reports `outcome: checks-passed`; whether and when the PR is merged is then the user's decision, and nothing observes the merge afterwards, so the recorded CI duration stops at the checks verdict instead of including the wait for a merge.
 
 This value is read only from the trusted default-branch copy of this file, like the rest of the `ci` block: a pushed branch cannot opt itself into the shorter run, or out of it.
@@ -1180,12 +1182,17 @@ Fields not set here inherit from global config and then the built-in defaults.
 | --- | --- | --- |
 | `test.evidence.store_in_repo` | `bool` | Inherits from global (default `false`) |
 | `test.evidence.attach_media` | `bool` | Inherits from global (default `true`) |
+| `test.evidence.compact` | `bool` | Inherits from global (default `true`) |
 | `test.evidence.dir` | `string` | Inherits from global (default `.no-mistakes/evidence`) |
 | `test.evidence.branch` | `string` | Inherits from global (default `no-mistakes/evidence`) |
 | `test.evidence.commit_message` | `string` | Inherits from global (default `no-mistakes: evidence for {{.Branch}} (run {{.RunID}})`) |
 
 By default, test evidence is written to `<NM_HOME>/evidence/<run-id>`. Where it is stored locally and how long it is kept are global-only settings; see [`test.evidence`](/no-mistakes/reference/global-config/#testevidence).
 For GitHub repositories, set `store_in_repo: true` to also publish it to an orphan evidence branch in the code branch's push-target repository and link the artifacts from the PR body; evidence is never committed to the pushed branch, so it never reaches the default branch.
+`compact: false` opts into expanded PR Testing presentation with inline previews while retaining published artifact links. See [global config](/no-mistakes/reference/global-config/#testevidence) for rendering details and publication requirements.
+
+Non-compact Testing sections are taller and can approach GitHub's PR body size limit sooner. Repository weight is unchanged: `store_in_repo` publishes the same artifacts to the evidence branch either way.
+
 `test.evidence.branch` is read ONLY from the trusted default-branch copy of this file, because it names a git ref the daemon pushes to; a pushed branch cannot redirect evidence commits.
 The other publication fields, including `test.evidence.commit_message`, are read from the pushed branch. The commit-message template shapes only the evidence commit subject and cannot select its target branch.
 See [global config](/no-mistakes/reference/global-config/#testevidence) for attachment behavior, credential-vault opt-out guidance, provider support, limits, validation, and fail-closed behavior.

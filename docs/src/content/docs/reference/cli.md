@@ -31,17 +31,22 @@ Initialize or refresh the gate for the current repository.
 no-mistakes init
 no-mistakes init --fork-url git@github.com:you/my-repo.git
 no-mistakes init --worktree-root ~/work/my-repo-runs
+no-mistakes init --skip-user-skill
 ```
 
-| Flag              | Type     | Default | Description                                                                                      |
-| ----------------- | -------- | ------- | ------------------------------------------------------------------------------------------------ |
-| `--fork-url`      | `string` | (none)  | GitHub fork remote URL to push branches to while opening PRs against `origin`                  |
-| `--worktree-root` | `string` | (none)  | Directory to create this repository's run worktrees in; prints the `worktree_roots` entry to add |
+| Flag                | Type     | Default | Description                                                                                      |
+| ------------------- | -------- | ------- | ------------------------------------------------------------------------------------------------ |
+| `--fork-url`        | `string` | (none)  | GitHub fork remote URL to push branches to while opening PRs against `origin`                  |
+| `--worktree-root`   | `string` | (none)  | Directory to create this repository's run worktrees in; prints the `worktree_roots` entry to add |
+| `--skip-user-skill` | `bool`   | `false` | Do not install or refresh the `/no-mistakes` agent skill at user level                           |
 
-Creates or refreshes a local bare repo, installs the managed pre-receive admission and post-receive notification hooks, best-effort isolates the gate repo's hook path from shared git config changes when Git supports `config --worktree`, adds or repairs the `no-mistakes` git remote, detects the default branch, records or updates the repo in SQLite, installs the `/no-mistakes` agent skill at user level into `~/.claude/skills/no-mistakes/SKILL.md` and `~/.agents/skills/no-mistakes/SKILL.md`, and ensures the daemon is running, installing the managed service when available and falling back to a detached daemon otherwise.
+Creates or refreshes a local bare repo, installs the managed pre-receive admission and post-receive notification hooks, best-effort isolates the gate repo's hook path from shared git config changes when Git supports `config --worktree`, adds or repairs the `no-mistakes` git remote, detects the default branch, records or updates the repo in SQLite, installs the `/no-mistakes` agent skill at user level into `~/.claude/skills/no-mistakes/SKILL.md` and `~/.agents/skills/no-mistakes/SKILL.md` (unless you pass `--skip-user-skill`), and ensures the daemon is running, installing the managed service when available and falling back to a detached daemon otherwise.
 `init` writes no skill files into the repo; the user-level copies serve Claude Code (`~/.claude/skills`) and agents that use the vendor-neutral `~/.agents/skills` convention (Codex, OpenCode, Rovo Dev, and Pi) across all repos. Grok Build is a pipeline runner and does not consume this installed skill.
 If the home `.claude` links to `.agents`, `.claude/skills` links to `.agents/skills`, or the reverse, `init` follows that layout and still makes the skill readable from both logical paths.
 If the repo still contains a vendored skill copy written by an older no-mistakes version, `init` leaves it untouched and prints a notice that it is no longer needed and can be removed.
+With `--skip-user-skill`, `init` does not run the skill installer at all: neither user-level `SKILL.md` is created, refreshed, or otherwise touched (including through the symlink layouts above), and a missing skills directory is not created.
+Everything else about `init` is unchanged, and it reports `skipped: --skip-user-skill` on its skill line.
+The flag applies to that run only and is not remembered, so a later `init` without it installs or refreshes the skill again.
 The gate advertises Git push-option support, so you can skip steps for one push with `git push -o no-mistakes.skip=test,lint no-mistakes <branch>`.
 
 For GitHub fork contributions, keep `origin` pointed at the parent repository and pass `--fork-url` with your fork remote URL.
@@ -61,7 +66,7 @@ It refuses to register a checkout that contains a directory an existing [`worktr
 It also refuses to register anything while `~/.no-mistakes/config.yaml` does not load, naming the fault, because the daemon refuses to start on that same config.
 
 Re-running `init` on an already-initialized repo succeeds and reports `Gate already initialized (refreshed)`.
-It refreshes managed gate wiring, origin/default-branch metadata, hook-path isolation, and the installed agent skill, overwriting any stale `SKILL.md` content from an older binary.
+It refreshes managed gate wiring, origin/default-branch metadata, hook-path isolation, and, unless you pass `--skip-user-skill`, the installed agent skill, overwriting any stale `SKILL.md` content from an older binary.
 When a fork URL is already recorded, re-running `init` without `--fork-url` preserves it.
 Passing `--fork-url` again replaces the stored fork URL after validation.
 If you rename or move an initialized working directory and the old path no longer exists, re-running `init` from the new path reattaches the existing gate, preserves the repo ID and run history, and updates the stored working path.
@@ -70,7 +75,7 @@ On a fresh init and on a refresh alike, `init` decides from the literal `no-mist
 When the checkout's `.git` is shared with another no-mistakes home (another `NM_HOME`, for example a linked worktree used by another OS account), that remote names the other home's gate, so the refusal names both gates and prints the per-account rewrite `git config --global 'url.<this gate>.insteadOf' '<other gate>'`, with both paths shell-quoted so it can be pasted as is.
 With that rewrite in your own global git config, `init` leaves the shared remote alone and your pushes through it reach your own gate; a rolled-back init or an `eject` from your home leaves it in place too.
 Fresh init rolls back gate setup when a required gate or daemon step fails; refresh does not eject a pre-existing gate if daemon startup fails.
-Skill installation is best-effort: if the skill write fails, init reports it and leaves the working gate in place.
+Skill installation is best-effort: if the skill write fails, init reports it and leaves the working gate in place. Passing `--skip-user-skill` is not a failure: the installer never runs and the gate is set up as usual.
 
 ## no-mistakes ci-workflow
 
@@ -224,13 +229,14 @@ Long-running `axi run` calls are working, not stalled; if one returns a `gate:`,
 `--wait` defaults to 8m so an agent harness with a 10-minute tool cap gets a structured error instead of an unbounded hang. It bounds the active-run lookup, event-subscription acknowledgement, and subsequent run driving. Elapsed wait is not a pipeline failure and does not mean the daemon is dead: run `no-mistakes axi status` and reattach with `axi run`. A live daemon that is slow to answer a pre-drive `get_active_run` or `get_run` state read is retried after a health probe rather than reported as an I/O failure or mistaken for an absent run.
 Backgrounding a call is fine for an agent harness, but the run never advances past a gate on its own.
 When CI readiness is established - every registered check is green, or the trusted default-branch config declares [`no_ci: true`](/no-mistakes/reference/repo-config/#no_ci) with no registered checks - and known mergeability is clear, `axi run` exits successfully with `outcome: checks-passed` instead of waiting for a human merge. A generic empty check list without that declaration is not ready.
-Treat that outcome as the agent stopping point: ask the user to review and merge the PR from the `help` line.
+Treat that outcome as the agent stopping point: ask the user to review and merge the PR from the `help` line, or run [`axi handoff`](#no-mistakes-axi-handoff) to end green monitoring without cancelling the run.
+`axi handoff` records `handed_off` only for an actively monitored open PR with persisted readiness; the PR remains open and is not treated as merged.
 By default the run stays active and keeps monitoring the same PR.
 While that monitor is running, do not run `axi run`, `rerun`, or a manual rebase: the monitor auto-rebases onto the base, resolves actual conflicts, revalidates from Review because rebasing cannot prove continuity with the reviewed head, and re-pushes the branch through Push, while a PR that is merely behind but clean needs no command.
 On GitHub, a clean PR whose base requires up-to-date branches (`mergeStateStatus: BEHIND`) still reports `checks-passed` and waits for a human to bring it up to date, unless the repository opts into [`ci.rebase_behind`](/no-mistakes/reference/repo-config/#cirebase_behind), in which case it is rebased the same way.
-After that monitor ends, see [`no-mistakes rerun`](#no-mistakes-rerun) for the restart conditions.
+After that monitor ends, see [`no-mistakes rerun`](#no-mistakes-rerun) for the restart conditions; an explicit handoff is terminal and does not request a rerun.
 Under [`ci.release_after_checks_pass`](/no-mistakes/reference/repo-config/#cirelease_after_checks_pass) the run finishes at that verdict instead: `run.status` is `checks_passed`, it releases its worktree and its lane, and nothing is left monitoring the PR, so a later update is a fresh `axi run` on the updated head - this run will not rebase or re-push it.
-Successful outcomes (`checks-passed`, `passed`, `passed-with-override`, and `passed-with-skips`) also carry `help` instructions telling the agent to summarize the run.
+Successful outcomes (`checks-passed`, `passed`, `passed-with-override`, `passed-with-skips`, and `handed-off`) also carry `help` instructions telling the agent to summarize the run.
 `passed-with-override` qualifies either `passed` or `checks-passed` when the run has an explicitly approved Test exception or a CI approval over still-failing checks.
 It stays a success, including at the checks-passed stopping point, but does not claim a clean validation.
 A Test exception is an approval past a failing configured `commands.test`, a `no-go` verdict, an `inconclusive` verdict, or a [`test_agent_timeout`](/no-mistakes/reference/global-config/#test_agent_timeout) budget cut; approving a `no-surface` park records its reason without adding the override qualification.
@@ -455,7 +461,7 @@ A custody-returned branch can later be rebased and force-with-lease pushed to it
 
 ### Custody recovery
 
-A run that goes terminal (cancelled, failed, or completed without a push stage) after moving the pipeline head leaves the branch `pipeline_owned`. Status offers `next_action.code: recover_custody` only when recovery can establish the same eligibility it will enforce: an equal or ahead local head proves the source locally and can create the local anchor when the gate is unavailable, but any existing gate recovery ref must still match the recorded head; importing a missing preserved head requires an exact run-specific gate anchor (or legacy commit evidence that can be anchored), a clean worktree, and either local ancestry or the content-preservation proof described below. The archive-backed keep-local exception has its own stricter proof below. An eligible state reports `safety: blocked_pipeline_owned_recoverable`, the run's terminal `pipeline.status`, and the exact `submitted_head`/`current_head`/`relation` ownership facts.
+A run that goes terminal (cancelled, failed, handed off, or completed without a push stage) after moving the pipeline head leaves the branch `pipeline_owned`. Status offers `next_action.code: recover_custody` only when recovery can establish the same eligibility it will enforce: an equal or ahead local head proves the source locally and can create the local anchor when the gate is unavailable, but any existing gate recovery ref must still match the recorded head; importing a missing preserved head requires an exact run-specific gate anchor (or legacy commit evidence that can be anchored), a clean worktree, and either local ancestry or the content-preservation proof described below. The archive-backed keep-local exception has its own stricter proof below. An eligible state reports `safety: blocked_pipeline_owned_recoverable`, the run's terminal `pipeline.status`, and the exact `submitted_head`/`current_head`/`relation` ownership facts.
 A run whose terminalization verifies that the managed worktree head never changed from the submitted head releases the branch instead: the terminal outcome, including cancellation, ends ownership; status reports `state: user_owned` with the same exact ownership facts and no `next_action`; the branch and head are immediately usable for any separately authorized delivery; and nothing blocks a direct push or PR.
 Without positive evidence that the submitted head stayed unchanged, custody is not guessed away. Conflicting evidence, import cases with a dirty worktree, and genuinely divergent history retain manual-reconciliation guidance instead of being labeled as a missing preserved head. When a verified recorded head is absent from both the invoking worktree and an accessible local gate, with compatible recovery refs, status reports `safety: blocked_recover_preserved_head_missing` with `next_action.code: recover_custody` and `no-mistakes axi sync --recover --keep-local`: that flag is the operator's explicit choice to keep the current local head and discard the missing preserved commits. An unavailable gate remains blocked because absence cannot be established there. The archive-backed keep-local exception has its own stricter proof below.
 While a run is still active, it reports `state: pipeline_owned`, the exact submitted/current heads and their relation, and `next_action.code: continue_active_run` with `no-mistakes axi status`, even when its head has not moved yet.
@@ -464,6 +470,7 @@ For equal or ahead worktrees where the preserved head is already locally reachab
 For behind or diverged worktrees, recovery verifies the preserved head at the run-specific recovery ref in the local gate and fetches it into the anchor before moving or refusing. Legacy recorded heads that remain available as unreferenced gate objects are anchored before recovery continues.
 A clean behind worktree fast-forwards.
 A diverged worktree is adopted only when the preserved head provably carries every local change, proven by an executable three-way merge whose result is exactly the preserved head's tree.
+When the local head exists only in the worktree and the preserved head only in the gate, status proves the relationship without importing anything (the objects are read through a throwaway union of the two object stores) and offers plain `--recover` only when recovery will succeed. If instead the local head already carries every change the preserved head made (the same three-way merge with the roles swapped), recovery anchors the preserved head, leaves the branch and worktree where they are, and returns custody at the local head; the preserved commits stay reachable at `refs/no-mistakes/recover/<run>`. A genuinely divergent pair, unrelated histories, a dirty worktree, or a conflicting recovery ref still refuse and keep both copies.
 This covers a pipeline rebase onto a newer base without requiring the gate branch to advance to the preserved head.
 Terminalization pins a verified unpublished pipeline head under a run-specific recovery ref, so recovery does not require the gate branch itself to have advanced. If the verified recorded head is absent from both the worktree and an accessible gate and the recovery refs are compatible, status still offers `recover_custody`, but the command is `--recover --keep-local` rather than taking that head. Plain `--recover` without `--keep-local` still refuses.
 That adoption anchors the pre-recovery local head under `refs/no-mistakes/recover-local/<run>`, then moves the branch with Git operations that refuse on their own rather than after a preceding check: an atomic compare-and-swap on the branch ref, and a working-tree update that aborts instead of overwriting a modified or untracked file.
@@ -508,6 +515,69 @@ Without `--full`, the summary is bounded like the gate's and long logs show the 
 Step logs include native subprocess agent lifecycle lines such as `codex started pid=4242`, `codex exited pid=4242 status=success`, and transient retry messages when the selected agent supports lifecycle events.
 They also include fix-loop markers such as `auto-fix round 1/3 starting after round 1` and `user-fix round starting after round 2`.
 `--step` accepts the nine core step names and valid repository gate names such as `gate.test.mutation-budget`. Use the exact gate name shown by `axi status`.
+
+## no-mistakes axi rounds
+
+Read the stored findings and decisions for every execution round of one step, in ascending round order.
+This is a read-only export for local tools that need round history without depending on the SQLite schema.
+It does not start or contact the daemon, run migrations, change a gate, or emit telemetry.
+
+```sh
+no-mistakes axi rounds --step review
+no-mistakes axi rounds --step review --run <id> --json
+no-mistakes axi rounds --step gate.test.mutation-budget --json
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--step` | `string` | (none) | Required core step or repository gate name |
+| `--run` | `string` | current-branch run | Inspect exactly this run, including from outside a checkout |
+| `--json` | `bool` | `false` | Emit JSON instead of TOON |
+
+Implicit run selection follows [`axi status`](#no-mistakes-axi-status): this branch's active run, then its most recent run, never another branch's.
+A detached HEAD requires `--run`.
+An unknown run, an unrecorded step, an unreadable database, or malformed stored findings or decisions exits 1 rather than reporting a clean history.
+A missing or invalid `--step` exits 2.
+Errors produced by the query use `error` in the selected encoding; JSON errors also carry `schema_version`.
+An existing step without recorded rounds succeeds with `rounds: []`.
+There is no fallback to the step's latest findings and no pagination or truncation.
+An active run's export is a snapshot; a subsequent call may include more rounds or a newly recorded decision.
+
+### JSON contract (version 1)
+
+The top-level keys are `schema_version` (currently `1`), `run_id`, `step`, and `rounds` (an ordered array).
+Each round has these fields:
+
+- `round`: the step-local round number; identify a round by `(run_id, step, round)`, not by finding ID alone.
+- `trigger`: the recorded execution trigger, such as `initial`, `auto_fix`, legacy `user_fix`, `coverage`, `answer`, or `retry`; consumers must allow new trigger values.
+- `summary` and `findings`: the round's complete summary and array of finding objects, or `null` when absent.
+  Finding fields are preserved, including optional fields and instructions; consumers must ignore unknown fields.
+  TOON prints an integer outside ±(2^53−1) as a quoted decimal string to keep it exact; `--json` keeps it a number.
+  An explicit empty findings array stays `[]` and does not mean that earlier findings were resolved.
+- `selected_finding_ids`: IDs selected for fixing **after this round**, or `null` when no selection was recorded.
+  `[]` is an explicit selection of nothing, distinct from no decision.
+- `selection_source`: the recorded source (`user`, `auto_fix`, or `user_declined`), or `null`.
+  An automatic selection does not mean the user declined the remaining findings.
+  `user_declined` does not distinguish approve, skip, and abort; this export does not infer a verdict or whether a fix succeeded.
+- `response_origin`: the recorded caller classification (`interactive`, `auto_yes`, or `unknown`).
+- `user_findings`: the merged finding array dispatched after user edits or additions, or `null` when absent.
+- `fix_summary`: the recorded fix result, or `null` when absent.
+- `duration_ms` and `created_at`: recorded duration in milliseconds and creation time in Unix seconds.
+
+Consumers should tolerate additive fields and new source/origin values; incompatible changes require a new `schema_version`.
+The export excludes internal configuration snapshots and does not publish anything remotely, but finding descriptions and instructions can still contain private repository information.
+
+## no-mistakes axi handoff
+
+End the current branch's green CI monitor when handing its open PR to human reviewers:
+
+```bash
+no-mistakes axi handoff
+```
+
+The daemon accepts this only while the CI step is actively monitoring an open PR and has persisted `checks-passed` readiness (including trusted declared-no-CI readiness). Pending or failed checks, approval gates, and runs without an open PR are refused with guidance to continue with `axi run`. Successful handoff waits for the run to stop and records terminal `handed_off`, rendered as the `handed-off` drive outcome. It neither merges nor closes the PR, and it does not claim a merge occurred. The open/green check is a snapshot at the monitor evaluation. Like other branch-scoped mutations, it must be run from the repository's current branch.
+
+Use `axi abort` to discard a run instead; its cancellation behavior is unchanged. Handoff is explicit and opt-in, not an automatic finish-on-green policy. If the run has already completed, no active monitor remains to hand off.
 
 ## no-mistakes axi abort
 
@@ -577,6 +647,13 @@ The retry refuses, changing nothing, unless every proof holds:
 | `matching head` | the local `HEAD` is exactly the preserved head; adopt it first with `no-mistakes axi sync --recover` |
 | `compatible configuration` | the run has no verification plan, its Pi profile still resolves to the same model and effort, and the repository's gates, read from the freshly fetched trusted default branch, are the gates the run pinned. A carried Review also needs the same effective repository configuration as the trusted commit its rounds recorded, the same global configuration when its rounds recorded one, and the same agent and model that served each carried step (an `auto` agent is resolved first). The configuration is checked twice: once before the launch, and again against the configuration the new run actually loads, so a change between the two refuses the retry. The refusal names the changed setting |
 | `review conversation` | a carried Review that recorded a question still has its question records on disk. They are copied into the new run, so open and withdrawn questions reach the PR body; if they are gone, the retry is refused |
+
+For the agent and model proof, configured reviewer fallbacks are eligible under
+the base or later-round role that served the invocation, including coverage turns.
+When an invocation recorded a configured model, that value must still match an
+eligible candidate, including its provider prefix. Removing or changing that
+candidate can therefore refuse the retry even when the reported model name is
+unchanged.
 
 Each refusal names the failed proof and points to `no-mistakes rerun`.
 The new run records which run, step, and round it continues, the failed step's error, and the preserved head it started from.
@@ -776,7 +853,7 @@ Checks:
 - Agent runners: native binaries `claude`, `codex`, `grok`, `acli`, `opencode`, `pi`, `copilot`, and `agy` (Antigravity), plus the optional ACP bridge `acpx`
 - ACP alias default binaries: `cursor-agent` plus `acpx` for `cursor`, and `devin` plus `acpx` for `devin`
 - Effective global agent configuration, reported as `gate validation`; an unavailable configured runner is a failed check because the gate cannot validate without it
-- Every configured [`forge_profiles`](/no-mistakes/reference/global-config/#forge_profiles) entry, reported as `forge <host>`: the profile resolves and validates, its provider CLI is installed, and that CLI is authenticated for the profile's host
+- Every configured [`forge_profiles`](/no-mistakes/reference/global-config/#forge_profiles) entry, reported as `forge <key>` (for example `forge github.com` or `forge github.com/owner`): the profile resolves and validates, its provider CLI is installed, and that CLI is authenticated for the profile's host
 - Every configured [`provider_plugins`](/no-mistakes/reference/global-config/#provider_plugins) entry, reported as `plugin <name>`: that its command executable resolves
 
 Uses indicators: `✓` (available), `–` (not found, optional), `✗` (problem detected).

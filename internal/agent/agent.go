@@ -79,7 +79,8 @@ type RunOpts struct {
 	OnAttempt func(Attempt)
 	// FormatRecovery, when enforceable, may restate a rejected terminal result.
 	// Adapters leave it nil. A nil or effectful recovery never runs the task again.
-	FormatRecovery *FormatRecovery
+	FormatRecovery  *FormatRecovery
+	ConfiguredModel string
 }
 
 // IsStructuredOutputRejected reports whether an invocation completed but its
@@ -129,6 +130,7 @@ func RejectStructuredOutput(err error) error {
 // invocation. An Agent may make several attempts when it retries transient
 // failures or moves to a fallback provider.
 type Attempt struct {
+	ConfiguredModel string
 	Agent           string
 	Result          *Result
 	Err             error

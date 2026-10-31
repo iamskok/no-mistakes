@@ -135,12 +135,18 @@ func prepareDaemonEnvironment() error {
 
 // applyLoginShellEnvironment applies a login-shell probe to the process and
 // keeps the service-supplied NM_HOME authoritative over anything the shell's
-// rc files export.
+// rc files export. A supplied telemetry opt-out also survives the probe, while
+// an enabling value may still be replaced by the shell's opt-out.
 func applyLoginShellEnvironment(apply func(...string) error, nmHome string) error {
+	var excluded []string
 	if nmHome != "" {
-		return apply("NM_HOME")
+		excluded = append(excluded, "NM_HOME")
 	}
-	return apply()
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("NO_MISTAKES_TELEMETRY"))) {
+	case "0", "false", "off":
+		excluded = append(excluded, "NO_MISTAKES_TELEMETRY")
+	}
+	return apply(excluded...)
 }
 
 // logDaemonPathSummary records the effective PATH at daemon startup so that
@@ -1529,6 +1535,20 @@ func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func(
 			return nil, fmt.Errorf("invalid params: %w", err)
 		}
 		if err := mgr.HandleCancel(p.RunID); err != nil {
+			return nil, err
+		}
+		return &ipc.CancelRunResult{OK: true}, nil
+	})
+
+	srv.Handle(ipc.MethodHandoffRun, func(ctx context.Context, params json.RawMessage) (interface{}, error) {
+		if err := refuseNested(ctx, false); err != nil {
+			return nil, err
+		}
+		var p ipc.CancelRunParams
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, fmt.Errorf("invalid params: %w", err)
+		}
+		if err := mgr.HandleHandoff(ctx, p.RunID); err != nil {
 			return nil, err
 		}
 		return &ipc.CancelRunResult{OK: true}, nil

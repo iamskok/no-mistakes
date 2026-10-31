@@ -117,6 +117,7 @@ test:
   evidence:
     store_in_repo: false
     attach_media: true
+    compact: true
     dir: .no-mistakes/evidence
     branch: no-mistakes/evidence
     commit_message: "no-mistakes: evidence for {{.Branch}} (run {{.RunID}})"
@@ -394,6 +395,34 @@ empty. Nonempty role values override that profile, but native
 `agent_args_override` flags still win. Model availability, credentials, and
 supported effort levels remain the harness/provider's responsibility.
 
+Reviewer roles (`reviewer` and `reviewer_after_round`) also accept an ordered,
+explicit `fallback` list. Each entry requires `agent` and accepts `model` and
+`effort` with the same inheritance and native-argument precedence as the role:
+
+```yaml
+review_agents:
+  reviewer:
+    agent: codex
+    fallback:
+      - {agent: pi, model: openai-codex/gpt-5.4, effort: high}
+```
+
+Only recognized invocation-time provider quota exhaustion advances this list.
+Launch errors, transient failures, invalid review output, timeouts and cancellation
+do not. Each replacement receives the complete review prompt without a session,
+inside the invocation's existing timeout. Subsequent review and coverage turns
+using that role stay on its selected reviewer rather than retrying exhausted
+candidates. The base and later-round reviewer roles have separate fallback chains.
+If all configured reviewers exhaust their quota, review fails without approval.
+The fallback log names both configured candidates, including same-harness profiles.
+See [local invocation evidence](/no-mistakes/reference/environment/#what-stays-local-and-what-leaves-the-machine)
+for the recorded identities.
+An OpenCode turn that ran tools, or whose tool activity is unknown, cannot fall
+back to a fresh reviewer session.
+These candidates are independent reviewer instances and never fall back to the
+writer or fixer implicitly. `fallback` is global-only, does not use quota routing,
+and accepts neither nested fallback lists nor `after_round`; fixer roles reject it.
+
 #### Later-round role overrides
 
 `reviewer_after_round` and `fixer_after_round` are opt-in overlays for long
@@ -514,7 +543,7 @@ For Codex, `service_tier` and reasoning effort tune different things: `service_t
 
 ### forge_profiles
 
-Optional machine-local routing for repositories that use different GitHub or GitLab identities. Keys are the raw host tokens recorded in the repository remote, including SSH aliases such as `github-personal`. Each entry must set exactly one provider config directory:
+Optional machine-local routing for repositories that use different GitHub or GitLab identities. Keys are the raw host tokens recorded in the repository remote, including SSH aliases such as `github-personal`. A `gh_user` profile key may also name one repository owner as `host/owner`. Each entry must set exactly one provider config directory, or select a signed-in GitHub login with `gh_user`:
 
 ```yaml
 forge_profiles:
@@ -525,24 +554,44 @@ forge_profiles:
   gitlab-work:
     glab_config_dir: ~/.config/glab-work
     expected_login: team-bot
+  github.com/remicaesar:
+    gh_user: remicaesar
 ```
 
 Paths must be absolute or begin with `~/`; environment variables and other shell expansion are not supported. Host keys are case-insensitive.
 
-When a repository matches a profile, no-mistakes validates it before starting the pipeline and applies an immutable environment to every subprocess in that run: built-in provider commands, custom shell commands, agents, managed agent servers, and the run's Git commands together with any hooks or credential helpers they spawn. A GitHub profile sets `GH_CONFIG_DIR` and removes higher-precedence GitHub token, host, and repository variables; a GitLab profile does the equivalent for `GLAB_CONFIG_DIR` and GitLab variables. The daemon process environment is never changed.
+`forge_profiles` is read from the global config only. Repository config, including the pushed branch's `.no-mistakes.yaml`, can never add, select, or change a profile, because a profile decides whose credentials the run executes with.
 
-Each selected GitHub config must contain the target host and exactly one account for it, with that account active. A selected GitLab config must contain the target host. An optional `expected_login` pins the account name the profile must be signed in as; resolution fails closed when the config's active login differs or is missing, so a swapped or re-authenticated config directory can never route a run through the wrong account. It carries an account name only, never credentials. `no-mistakes doctor` validates every configured profile and its online authentication.
+When a repository matches a profile, no-mistakes validates it before starting the pipeline and applies an immutable environment to every subprocess in that run: built-in provider commands, custom shell commands, agents, managed agent servers, and the run's Git commands together with any hooks or credential helpers they spawn. A GitHub profile sets `GH_CONFIG_DIR` (or, for a `gh_user` profile, the selected login's token, described below) and removes higher-precedence GitHub token, host, and repository variables; a GitLab profile does the equivalent for `GLAB_CONFIG_DIR` and GitLab variables. The daemon process environment is never changed.
 
-Profile activation is provider-specific and fail-closed: after at least one GitHub profile is configured, a GitHub repository must match a GitHub profile; GitLab remains ambient unless a GitLab profile is also configured, and vice versa. With no `forge_profiles`, provider detection and ambient CLI authentication behave exactly as before.
+Each selected GitHub config directory (`gh_config_dir`) must contain the target host and exactly one account for it, with that account active. A selected GitLab config must contain the target host. An optional `expected_login` pins the account name the profile must be signed in as; resolution fails closed when the config's active login differs or is missing, so a swapped or re-authenticated config directory can never route a run through the wrong account. It carries an account name only, never credentials. `no-mistakes doctor` validates every configured profile and its online authentication.
 
-For a GitHub fork, no-mistakes considers both the parent and fork host tokens. A match on either side is sufficient. If both match, they must select the same account: the same effective provider config directory *and* the same `expected_login` pin. Otherwise startup fails as ambiguous, so two host tokens sharing a config directory while pinning different logins can never silently resolve to one of them. Fork PR topology itself is unchanged.
+#### Choosing one of several gh accounts with `gh_user`
+
+When one gh configuration holds several accounts for the same host, `gh_user` selects one of them by login without a separate config directory or SSH alias. Key the profile by `host/owner` so it applies only to repositories that owner holds:
+
+```yaml
+forge_profiles:
+  github.com/remicaesar:
+    gh_user: remicaesar
+```
+
+At run setup, no-mistakes runs `gh auth token --hostname <host> --user <gh_user>` once, against the ambient gh configuration, and gives that token to every subprocess in the run as `GH_TOKEN` (`GH_ENTERPRISE_TOKEN` on a GitHub Enterprise Server host). The other GitHub token, host, and repository variables are removed as for any GitHub profile. gh prefers that variable over its active account, and `gh auth git-credential` returns it, so HTTPS pushes through the gh credential helper authenticate as the same login. The token is held in memory for the run only: it never appears in arguments, logs, files, or the run record, and a recovered run reads it again. A profile never stores a token itself.
+
+If gh has no token for that login on the host (the login is unknown or signed out), the run fails at setup with the gh error; it never falls back to the active account. `gh_user` cannot be combined with `gh_config_dir`, `glab_config_dir`, or `expected_login` (the login it names is already the pin).
+
+An owner-scoped key is looked up before its plain host key, and a repository whose owner has no scoped key falls back to the plain host key, so existing host-keyed profiles keep working unchanged. An owner-scoped key never activates routing for other owners: with only `github.com/remicaesar` configured, repositories other owners hold on `github.com` keep ambient authentication. Owner-scoped keys are supported for `gh_user` profiles only.
+
+Profile activation is provider-specific and fail-closed: after at least one plain host-keyed GitHub profile is configured, a GitHub repository must match a GitHub profile; GitLab remains ambient unless a GitLab profile is also configured, and vice versa. With no `forge_profiles`, provider detection and ambient CLI authentication behave exactly as before.
+
+For a GitHub fork, no-mistakes considers both the parent and fork remotes. A match on either side is sufficient. If one side matches an owner-scoped key and the other only a plain host key, the owner-scoped profile wins, so a contributor's fork owner selects the account that pushes to the fork and opens the PR. Otherwise, if both match, they must select the same account: the same effective provider config directory, the same `expected_login` pin, *and* the same `gh_user`. Otherwise startup fails as ambiguous, so two host tokens sharing a config directory while pinning different logins can never silently resolve to one of them. Fork PR topology itself is unchanged.
 
 Deliberate scope boundaries, so profiles never duplicate what other layers own:
 
 - **Commit identity stays with Git.** Author and committer for pipeline fix commits come from the effective Git configuration (for example remote-keyed `includeIf` sections), which resolves naturally inside run worktrees. Profiles carry no name/email fields.
-- **Two accounts on the same host are distinguished by remote host tokens.** Give each account its own SSH alias (`github-personal`, `github-work`) and key a profile per alias; a profile cannot disambiguate two accounts behind one identical remote URL.
+- **Two accounts on the same host are distinguished by remote host token or repository owner.** Either give each account its own SSH alias (`github-personal`, `github-work`) and key a profile per alias, or key GitHub profiles by `host/owner` with `gh_user`; a profile cannot disambiguate two accounts behind one identical remote URL.
 - **Executable selection stays with the machine.** Which `gh`, `glab`, or `git` runs is owned by `PATH` and the existing command resolution, not by profile configuration.
-- **Credential-helper context stays with Git configuration.** Profiles point at provider CLI config directories and never model or store credential material; credentials remain in the CLI's own store.
+- **Credential-helper context stays with Git configuration.** Profiles point at provider CLI config directories or name a login, and never model or store credential material; credentials remain in the CLI's own store, and a `gh_user` token is only read from it for the run.
 
 ### provider_plugins
 
@@ -593,7 +642,7 @@ A genuinely idle/abandoned PR still parks at an approval gate after the timeout 
 While that CI gate is parked, the daemon continues bounded read-only PR-state checks.
 If the PR is merged or closed externally, the stale gate completes automatically; an open, unknown, or temporarily unreachable PR remains parked for a user decision.
 
-Set it to `unlimited` (`none`, `off`, and `never` are accepted aliases), `0`, or any non-positive duration to disable this timeout. A run still ends when the PR is merged or closed, or at readiness under `ci.release_after_checks_pass`. You can cancel it with `no-mistakes axi abort --run <id>`.
+Set it to `unlimited` (`none`, `off`, and `never` are accepted aliases), `0`, or any non-positive duration to disable this timeout. A run still ends when the PR is merged, closed, or declined, when green monitoring is explicitly handed off, or at readiness under `ci.release_after_checks_pass`. You can end it explicitly with `no-mistakes axi handoff` or cancel it with `no-mistakes axi abort --run <id>`.
 
 Legacy alias: `babysit_timeout`.
 
@@ -1293,10 +1342,12 @@ repository_overrides:
     pr:
       template: .github/pull_request_template.md
       appendix: collapsed
+      update_text: keep # keep | regenerate (default)
 ```
 
 `pr.template` selects a repository-relative file, never local template contents. It uses the same [path and file validation](/no-mistakes/reference/repo-config/#prtemplate) as the repository setting, and its bytes are read only from the pinned trusted default-branch tree, never from the pushed branch or worktree.
 `pr.appendix` accepts `full`, `collapsed`, or `minimal` and can be set with or without `pr.template`; it uses the same [appendix and attestation behavior](/no-mistakes/reference/repo-config/#prappendix) as the repository setting. When template mode is active, author-edited narrative is preserved on later updates.
+`pr.update_text` accepts `keep` or `regenerate`. The default is `regenerate`, also used when the key is absent. `regenerate` replaces the title and body on update, as today, but only while the live body carries no owned appendix markers. Once `keep` has created or updated a PR, that PR keeps its title and narrative even after the key changes back to `regenerate` or is removed, the same rule that stops removing `pr.template` from switching an owned body back. `keep` leaves the live title unchanged and keeps the narrative above the appendix byte for byte, the same preservation [`pr.template`](/no-mistakes/reference/repo-config/#prtemplate) already uses, including when that repository has no template file. The step still creates the pull request when none exists: the ordinary drafter supplies the title and narrative, and the evidence is stored as that owned appendix. Every later update refreshes the appendix, or the `minimal` risk line, and the attestation, so they match the current head. If that narrative and the evidence cannot fit the publication budget, the step fails instead of truncating them. A configured `pr.title_format` still redrafts the bare title. An existing body that already carries an unowned attestation is refused until that generated evidence is separated from the narrative, the same adoption rule as template mode. To prepare an already open PR that an earlier `regenerate` run published, move its generated evidence out of the body by hand once before enabling `keep`. Any other value fails config loading. A repository `.no-mistakes.yaml` cannot set this key, and it is not a machine-wide `pr` setting.
 For `pr.template`, a non-empty trusted repository value wins over the matching machine-local value. For appendix inheritance, see [`pr.appendix` precedence](#prappendix).
 `pr.template` is available only under `repository_overrides`, not as a machine-wide PR setting. `pr.publish_intent` remains trusted-repository-only.
 
@@ -1423,6 +1474,7 @@ By default, evidence artifacts are written to `<NM_HOME>/evidence/<run-id>`. On 
 | ----------------------------- | -------- | ------------------------ | -------------------------------------------------------------------------- |
 | `test.evidence.store_in_repo` | `bool`   | `false`                  | Publish test evidence artifacts to the repository's orphan evidence branch |
 | `test.evidence.attach_media`  | `bool`   | `true`                   | Upload image and video evidence to GitHub user-attachments when the PR is rendered |
+| `test.evidence.compact`       | `bool`   | `true`                   | Keep the PR Testing section compact; set `false` for inline previews and expanded details |
 | `test.evidence.dir`           | `string` | `.no-mistakes/evidence`  | Directory prefix inside the evidence branch                                |
 | `test.evidence.branch`        | `string` | `no-mistakes/evidence`   | Name of the orphan evidence branch                                         |
 | `test.evidence.commit_message` | `string` | `no-mistakes: evidence for {{.Branch}} (run {{.RunID}})` | Subject template for evidence-branch commits |
@@ -1430,10 +1482,14 @@ By default, evidence artifacts are written to `<NM_HOME>/evidence/<run-id>`. On 
 | `test.evidence.retention`     | `string` | `336h` (14 days)         | How long a run's evidence survives; `unlimited`/`none`/`off`/`never` or a non-positive duration disables the bound |
 | `test.evidence.max_runs`      | `int`    | `200`                    | How many run directories survive regardless of age; `0` disables the bound |
 
+`compact: true` preserves the compact PR Testing section. Set `compact: false` to opt into inline screenshot/GIF previews, video embeds, visible log/text blocks, individual test-command bullets, and a summary bullet. Both modes retain inspectable artifact links alongside previews when published links are available. This presentation setting does not enable uploads or evidence publication; for commit-pinned inline images, also enable `store_in_repo`.
+
+Non-compact sections are taller and can approach GitHub's PR body size limit sooner, especially with many screenshots. Repository weight is unchanged: with `store_in_repo` enabled, the same artifacts are committed to the evidence branch in either mode. Pipeline steps and their order are unchanged.
+
 The test step always collects evidence outside the worktree, so artifacts never enter the branch under validation.
 On GitHub.com and GitHub Enterprise Cloud, image and video artifacts that pass GitHub's attach rules (png, jpg, jpeg, gif, webp, svg, mp4, mov, webm; images at most 10 MiB and videos at most 100 MiB) are uploaded to GitHub user-attachments when the PR body is rendered, unless `attach_media` is false. Setting `attach_media: false` disables uploads even when `store_in_repo: true`; evidence-branch publication and its commit-pinned links remain enabled.
 Uploads need the raw GitHub token, which the PR step reads once per PR render with `gh auth token`; when that read fails, the step logs one line and skips every remaining upload in that render instead of asking again per file. If your `gh` sits behind a credential vault or disclosure gate that prompts before it releases the token, set `attach_media: false` so the PR step never asks for it.
-The testing section embeds the returned image markdown or bare video URL so remote reviewers can open the media. Upload is fail-closed: any error, unsupported type, oversize file, GitHub Enterprise Server, non-GitHub forge, or GitHub App/Actions token keeps today's rendering (a commit-pinned evidence-branch link if `store_in_repo` published, otherwise a local path) rather than a dead attachment URL. Text artifacts stay inlined as they are today.
+The testing section embeds the returned image markdown or bare video URL so remote reviewers can open the media. Upload is fail-closed: any error, unsupported type, oversize file, GitHub Enterprise Server, non-GitHub forge, or GitHub App/Actions token falls back to the configured evidence presentation rather than a dead attachment URL. Published evidence retains commit-pinned links, with previews when `compact: false`; unpublished local artifacts retain local references. Text artifacts remain inline or collapsible according to `compact`.
 When `store_in_repo` is true for a GitHub repository, the PR step copies that directory onto `branch` under `<dir>/<branch-slug>` in the code branch's push-target repository (the fork when fork routing is configured), pushes it, and links the artifacts from the pull request body.
 Published text files get the same home-directory redaction as the PR title and body, so a path under the operator's home is committed with that part rewritten to `~`. Before that, the run's worktree root, and any path into another run worktree under `<NM_HOME>/worktrees/<repo-id>/<run-id>`, is rewritten to `{run-worktree}` (a bare `<NM_HOME>/worktrees` or `<NM_HOME>/worktrees/<repo-id>` to `{worktrees}`), because the repo id is a hash of the local checkout path and `NM_HOME` may sit outside the home directory. Binary and visual artifacts are published as written, and the local evidence files are never changed.
 When both `attach_media` and `store_in_repo` apply, the testing section carries the user-attachments embed in addition to the commit-pinned git link.
@@ -1461,7 +1517,7 @@ Reaping runs after each finished run and again at daemon startup. An upgraded da
 
 `local_root` must be an absolute path outside `<NM_HOME>/worktrees`; a relative or managed-worktree path fails daemon startup and prevents new or recovered runs from starting. Because `retention` bounds how long a PR body's local artifact links keep resolving, raise it rather than lowering it if your reviews run long.
 
-The publication fields are global defaults. Repo config can override `store_in_repo`, `attach_media`, `dir`, and `commit_message`; it can override `branch` only through the trusted default-branch copy. `local_root`, `retention`, and `max_runs` are global-only: a repository does not get to name a filesystem path this machine's daemon writes to, or set the retention budget for a directory every repository on the machine shares.
+The publication fields are global defaults. Repo config can override `store_in_repo`, `attach_media`, `compact`, `dir`, and `commit_message`; it can override `branch` only through the trusted default-branch copy. `local_root`, `retention`, and `max_runs` are global-only: a repository does not get to name a filesystem path this machine's daemon writes to, or set the retention budget for a directory every repository on the machine shares.
 
 `test.evidence.retention` and `test.evidence.max_runs` also bound `<NM_HOME>/logs/<run-id>` (per-run step logs), reaped on the same cadence rather than through a second config surface for the same kind of per-run diagnostic artifact.
 

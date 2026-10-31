@@ -133,6 +133,7 @@ func emitAgentAttempt(opts RunOpts, name string, result *Result, err error, star
 		return
 	}
 	opts.OnAttempt(Attempt{
+		ConfiguredModel: opts.ConfiguredModel,
 		Agent:           name,
 		Result:          result,
 		Err:             err,

@@ -18,6 +18,10 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// consoleAllocationPolicyBuild is the first Windows build that honors the
+// manifest's consoleAllocationPolicy (Windows 11 24H2, Server 2025).
+const consoleAllocationPolicyBuild = 26100
+
 // TestIsTaskkillAlreadyGone pins down the locale-independent contract the
 // Windows cancel path relies on: taskkill exit code 128 (no matching PID) is
 // the only nonzero exit treated as "the child already exited", so every other
@@ -71,7 +75,40 @@ func TestStartShellCommandFailsWhenJobSetupFails(t *testing.T) {
 
 func TestConfigureCooperativeShellCommandCancelAllowsCleanup(t *testing.T) {
 	installWindowsCooperativeCommandTestHelper(t)
+	assertCooperativeCancelAllowsCleanup(t)
+}
 
+// Issue #1653: the shipped no-mistakes.exe carries the manifest's
+// consoleAllocationPolicy=detached, which also overrides the CREATE_NEW_CONSOLE
+// the cooperative helper is started with. The real binary as helper must still
+// share a console with its target, or CTRL_BREAK never reaches the command and
+// cancellation force-kills it without its cleanup window. The test binary
+// carries no manifest, so only the real build shows this.
+func TestConfigureCooperativeShellCommandCancelAllowsCleanupWithShippedHelper(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds no-mistakes.exe")
+	}
+	if _, _, build := windows.RtlGetNtVersionNumbers(); build < consoleAllocationPolicyBuild {
+		t.Skipf("Windows build %d ignores consoleAllocationPolicy (needs %d, Windows 11 24H2 / Server 2025)", build, consoleAllocationPolicyBuild)
+	}
+	exe := filepath.Join(t.TempDir(), "no-mistakes.exe")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	build := exec.CommandContext(ctx, "go", "build", "-o", exe, "github.com/kunchenguid/no-mistakes/cmd/no-mistakes")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build no-mistakes.exe: %v\n%s", err, out)
+	}
+	old := windowsCooperativeHelperCommandFunc
+	windowsCooperativeHelperCommandFunc = func(eventName, targetPath string, targetArgs []string) (string, []string, error) {
+		args := append([]string{exe, windowsCooperativeCommandArg + eventName, targetPath}, targetArgs...)
+		return exe, args, nil
+	}
+	t.Cleanup(func() { windowsCooperativeHelperCommandFunc = old })
+	assertCooperativeCancelAllowsCleanup(t)
+}
+
+func assertCooperativeCancelAllowsCleanup(t *testing.T) {
+	t.Helper()
 	dir := t.TempDir()
 	ready := filepath.Join(dir, "ready")
 	cleanup := filepath.Join(dir, "cleanup")
@@ -250,7 +287,7 @@ func startWindowsCommandCancellationTest(t *testing.T, cancel context.CancelFunc
 
 func waitForWindowsHelperPID(t *testing.T, path string, run *windowsCommandCancellationTestRun, output *bytes.Buffer) int {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		select {
 		case <-run.done:

@@ -7,17 +7,22 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"unicode"
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/intent"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
+	"github.com/kunchenguid/no-mistakes/internal/safeurl"
 	"github.com/kunchenguid/no-mistakes/internal/scm"
 	"github.com/kunchenguid/no-mistakes/internal/testguidance"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
 var errCIAttestationUnsettled = errors.New("CI repair attestation is unsettled")
+
+var errCIFixAgentCrash = errors.New("CI fix agent crashed")
 
 // errAttestationWriteFailed marks a failure specifically inside
 // attestHeadBeforePush (PR discovery or the attestation write itself), as
@@ -155,6 +160,24 @@ func (s *CIStep) repairFromFindings(sctx *pipeline.StepContext, host scm.Host, p
 		// An ordinary fix failure is cheap to repeat and often works the next
 		// time: the next settled observation re-emits the findings and the
 		// executor retries while auto_fix.ci allows.
+		if errors.Is(err, errCIFixAgentCrash) {
+			s.fixAgentCrashes++
+			cause := intent.RedactSecrets(safeurl.RedactText(err.Error()))
+			cause = strings.Map(func(r rune) rune {
+				if unicode.IsControl(r) {
+					return ' '
+				}
+				return r
+			}, cause)
+			cause = strings.Join(strings.Fields(cause), " ")
+			// Error text can contain a whole agent transcript. Keep the
+			// published finding below the IPC frame budget, even for UTF-8.
+			runes := []rune(cause)
+			if len(runes) > 256 {
+				cause = string(runes[:256]) + "..."
+			}
+			s.lastFixAgentCrash = cause
+		}
 		sctx.Log(fmt.Sprintf("warning: CI fix failed: %v", err))
 		return nil, nil
 	}
@@ -309,6 +332,9 @@ CI logs:
 		OnChunk:    sctx.LogChunk,
 	})
 	if err != nil {
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, pipeline.ErrAgentTimeout) {
+			err = fmt.Errorf("%w: %w", errCIFixAgentCrash, err)
+		}
 		return ciRepairResult{}, fmt.Errorf("agent CI fix: %w", err)
 	}
 

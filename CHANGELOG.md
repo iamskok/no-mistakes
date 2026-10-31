@@ -1,5 +1,57 @@
 # Changelog
 
+## [1.105.0](https://github.com/kunchenguid/no-mistakes/compare/v1.104.0...v1.105.0) (2026-10-30)
+
+
+### Features
+
+* **pipeline:** add pr.update_text keep mode to preserve PR title and narrative ([#1654](https://github.com/kunchenguid/no-mistakes/issues/1654)) ([4626813](https://github.com/kunchenguid/no-mistakes/commit/46268130ed88c184436bb7f51679a7cc9e7c17bb))
+
+
+### Bug Fixes
+
+* **daemon:** keep the Windows daemon console-less at logon ([#1657](https://github.com/kunchenguid/no-mistakes/issues/1657)) ([3ef3bde](https://github.com/kunchenguid/no-mistakes/commit/3ef3bde04915bcdf6ae716df8caa6da0dd98bb3a))
+* **pipeline:** bound the Test evidence turn's completion and state its budget ([#1658](https://github.com/kunchenguid/no-mistakes/issues/1658)) ([1144220](https://github.com/kunchenguid/no-mistakes/commit/1144220a931a558d45d6895914d4635a0565b8a3)), closes [#1576](https://github.com/kunchenguid/no-mistakes/issues/1576)
+
+## [1.104.0](https://github.com/kunchenguid/no-mistakes/compare/v1.103.0...v1.104.0) (2026-10-29)
+
+
+### Features
+
+* add opt-in handoff for green CI monitors ([#1518](https://github.com/kunchenguid/no-mistakes/issues/1518)) ([02144b0](https://github.com/kunchenguid/no-mistakes/commit/02144b005064e825485b39d03d718a0047c622f6))
+* **cli:** add axi rounds to export per-round findings and decisions ([#1650](https://github.com/kunchenguid/no-mistakes/issues/1650)) ([7c88a31](https://github.com/kunchenguid/no-mistakes/commit/7c88a31a5513a7dd1d1f3cba28479623b2e3fbd4))
+* **forgecontext:** select a signed-in gh login per repository owner ([#1652](https://github.com/kunchenguid/no-mistakes/issues/1652)) ([69918d7](https://github.com/kunchenguid/no-mistakes/commit/69918d7f3e744a4c848c1b49843327c68a8a63bb))
+
+
+### Bug Fixes
+
+* **daemon:** preserve telemetry opt-out in managed services ([#1644](https://github.com/kunchenguid/no-mistakes/issues/1644)) ([7537785](https://github.com/kunchenguid/no-mistakes/commit/7537785a0df9e8111a8dcf8b8d0b688dedadfee7))
+* **pipeline:** retain CI fix-agent crash diagnostics after checks pass ([#1642](https://github.com/kunchenguid/no-mistakes/issues/1642)) ([3bf6783](https://github.com/kunchenguid/no-mistakes/commit/3bf6783380a2aa58359c0d83d5cce8cf15f22ab4))
+
+## [1.103.0](https://github.com/kunchenguid/no-mistakes/compare/v1.102.1...v1.103.0) (2026-10-28)
+
+
+### Features
+
+* **agent:** add explicit reviewer quota fallback chains ([#1634](https://github.com/kunchenguid/no-mistakes/issues/1634)) ([f2a99ec](https://github.com/kunchenguid/no-mistakes/commit/f2a99ec90167a4e173f6e5098224091701a50251))
+* **pipeline:** support expanded PR testing evidence ([#1632](https://github.com/kunchenguid/no-mistakes/issues/1632)) ([15ff6d8](https://github.com/kunchenguid/no-mistakes/commit/15ff6d8c21cd8f7df088219aef9ad3fc450b9b87))
+
+
+### Bug Fixes
+
+* **agent:** preserve completed results after wait delay ([#1637](https://github.com/kunchenguid/no-mistakes/issues/1637)) ([e758a76](https://github.com/kunchenguid/no-mistakes/commit/e758a76f58e2f36a902c119c8220625622ee0936))
+* **pipeline:** prevent ignore patterns from bypassing trusted review ([#1640](https://github.com/kunchenguid/no-mistakes/issues/1640)) ([4bdc121](https://github.com/kunchenguid/no-mistakes/commit/4bdc12107669d6ad6e8bac19118d17496d69654d))
+* **pipeline:** respect intent in Test and Document repairs ([#1638](https://github.com/kunchenguid/no-mistakes/issues/1638)) ([acf0b3e](https://github.com/kunchenguid/no-mistakes/commit/acf0b3e9b5c6db66ad1330d085c94e179394a4e7))
+* **scm:** accept configured GitLab MR web hosts ([#1639](https://github.com/kunchenguid/no-mistakes/issues/1639)) ([91afff1](https://github.com/kunchenguid/no-mistakes/commit/91afff1a10d919dce7ed80f6ca1e75c52e6923f4))
+
+## [1.102.1](https://github.com/kunchenguid/no-mistakes/compare/v1.102.0...v1.102.1) (2026-10-27)
+
+
+### Bug Fixes
+
+* **gate:** never rewrite another no-mistakes home's gate remote on init ([#1625](https://github.com/kunchenguid/no-mistakes/issues/1625)) ([9762fbd](https://github.com/kunchenguid/no-mistakes/commit/9762fbdfc808f7128782fdc4f61ab050f9fcb6b5))
+* **pipeline:** redact run worktree paths in the PR body ([#1623](https://github.com/kunchenguid/no-mistakes/issues/1623)) ([8f3bbe4](https://github.com/kunchenguid/no-mistakes/commit/8f3bbe4f8c6689fac50edace35cb539788c9897c))
+
 ## [1.102.0](https://github.com/kunchenguid/no-mistakes/compare/v1.101.0...v1.102.0) (2026-10-26)
 
 

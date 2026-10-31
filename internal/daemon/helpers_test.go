@@ -18,6 +18,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/paths"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/types"
+	"github.com/kunchenguid/no-mistakes/internal/winproc"
 )
 
 func TestMain(m *testing.M) {
@@ -50,6 +51,30 @@ func TestMain(m *testing.M) {
 			_, _ = os.Stderr.WriteString(err.Error() + "\n")
 			os.Exit(2)
 		}
+		os.Exit(0)
+	case "run-stdio":
+		// The run_stdio tests start this with prepared standard handles and
+		// look for each marker where daemon run's output must land.
+		if err := PrepareRunStdio(); err != nil {
+			os.Exit(3)
+		}
+		_, _ = os.Stdout.WriteString("stdout-marker\n")
+		_, _ = os.Stderr.WriteString("stderr-marker\n")
+		println("runtime-stderr-marker") // the runtime's own stderr handle, as crash output uses
+		exe, err := os.Executable()
+		if err != nil {
+			os.Exit(4)
+		}
+		child := exec.Command(exe)
+		child.Env = upsertEnv(os.Environ(), "NM_DAEMON_HELPER_PROCESS", "stderr-marker")
+		child.Stderr = os.Stderr // as the bootstrap log-sink inherits it
+		winproc.Harden(child)
+		if err := child.Run(); err != nil {
+			os.Exit(5)
+		}
+		os.Exit(0)
+	case "stderr-marker":
+		_, _ = os.Stderr.WriteString("child-stderr-marker\n")
 		os.Exit(0)
 	case "capture-output":
 		p := paths.WithRoot(os.Getenv("NM_HOME"))

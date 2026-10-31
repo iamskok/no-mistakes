@@ -391,23 +391,40 @@ func (m *RunManager) proveCarriedAgent(ctx context.Context, source *db.Run, cfg 
 				}
 				resolved = true
 			}
-			expected := cfgForInvocation(cfg, inv)
-			name := types.AgentName(inv.Agent)
-			if name != expected.Agent && !slices.Contains(expected.Agents, name) {
-				return fmt.Errorf("carried step %s ran on agent %s, which is no longer selected (agent is now %s); rerun the pipeline instead", inv.StepName, inv.Agent, expected.Agent)
+			var mismatch error
+			for _, expected := range configsForInvocation(cfg, inv) {
+				name := types.AgentName(inv.Agent)
+				if name != expected.Agent && !slices.Contains(expected.Agents, name) {
+					if mismatch == nil {
+						mismatch = fmt.Errorf("carried step %s ran on agent %s, which is no longer selected (agent is now %s); rerun the pipeline instead", inv.StepName, inv.Agent, expected.Agent)
+					}
+					continue
+				}
+				model := expected.AgentProfileFor(name).Model
+				if inv.ConfiguredModel != nil && *inv.ConfiguredModel != model {
+					mismatch = fmt.Errorf("carried step %s used configured model %s, which is no longer selected for %s; rerun the pipeline instead", inv.StepName, *inv.ConfiguredModel, inv.Agent)
+					continue
+				}
+				model = agentcfg.EffectiveModel(name, expected.AgentProfileFor(name), expected.AgentArgsFor(name))
+				if model != "" && inv.Model != "" && !strings.Contains(inv.Model, model) && !agentcfg.ServedMatchesRequested(model, inv.Model, "") {
+					mismatch = fmt.Errorf("carried step %s ran %s on model %s, but the effective model for %s is now %s; rerun the pipeline instead", inv.StepName, inv.Agent, inv.Model, inv.Agent, model)
+					continue
+				}
+				mismatch = nil
+				break
 			}
-			if model := expected.AgentProfileFor(name).Model; model != "" && inv.Model != "" && !strings.Contains(inv.Model, model) {
-				return fmt.Errorf("carried step %s ran %s on model %s, but agent_config.%s.model is now %s; rerun the pipeline instead", inv.StepName, inv.Agent, inv.Model, inv.Agent, model)
+			if mismatch != nil {
+				return mismatch
 			}
 		}
 	}
 	return nil
 }
 
-// cfgForInvocation returns the configuration that would serve inv in a new run,
+// configsForInvocation returns the configurations eligible to serve inv in a new run,
 // selecting a review_agents role from the call's Purpose and Round the way
 // newPipelineAgent routes it.
-func cfgForInvocation(cfg *config.Config, inv db.AgentInvocation) *config.Config {
+func configsForInvocation(cfg *config.Config, inv db.AgentInvocation) []*config.Config {
 	var role, lateRole string
 	switch inv.Purpose {
 	case "review", "review-coverage":
@@ -415,17 +432,25 @@ func cfgForInvocation(cfg *config.Config, inv db.AgentInvocation) *config.Config
 	case "review-fix":
 		role, lateRole = config.RoleFixer, config.RoleFixerAfterRound
 	default:
-		return cfg
+		return []*config.Config{cfg}
 	}
 	if late, ok := cfg.ReviewAgents[lateRole]; ok {
 		if from := cfg.ReviewAgentTakeoverRound(lateRole); from > 0 && inv.Round >= from {
-			return cfg.ForReviewAgent(late)
+			return reviewCandidateConfigs(cfg, late)
 		}
 	}
 	if entry, ok := cfg.ReviewAgents[role]; ok {
-		return cfg.ForReviewAgent(entry)
+		return reviewCandidateConfigs(cfg, entry)
 	}
-	return cfg
+	return []*config.Config{cfg}
+}
+
+func reviewCandidateConfigs(cfg *config.Config, entry config.ReviewAgent) []*config.Config {
+	configs := []*config.Config{cfg.ForReviewAgent(entry)}
+	for _, candidate := range entry.Fallback {
+		configs = append(configs, cfg.ForReviewAgent(candidate))
+	}
+	return configs
 }
 
 // proveAtLaunch repeats the configuration proof against the configuration the
